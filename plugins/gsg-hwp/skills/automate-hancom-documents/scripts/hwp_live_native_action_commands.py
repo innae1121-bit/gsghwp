@@ -219,6 +219,15 @@ class ReplaceSelectionCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class LiteralTextRange:
+    """UTF-16 offsets in inspected paragraph text, never native cursor offsets."""
+
+    paragraph_text: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True, slots=True)
 class TextPatchCommand:
     target: Literal["current", "range", "find", "table_cell"]
     expected_text: str | None
@@ -231,6 +240,7 @@ class TextPatchCommand:
     cell_address: str | None = None
     preserve_format: bool = False
     preflight_only: bool = False
+    literal_range: LiteralTextRange | None = None
 
 
 @dataclass(frozen=True, slots=True)

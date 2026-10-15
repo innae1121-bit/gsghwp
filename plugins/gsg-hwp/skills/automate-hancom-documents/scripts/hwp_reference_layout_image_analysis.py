@@ -30,6 +30,7 @@ from hwp_reference_layout_gap_snapping import (
     snap_column_gap_breakpoints,
 )
 from hwp_reference_layout_image_evidence import (
+    detect_layout_lines_from_image,
     snap_layout_breakpoints_from_image,
 )
 
@@ -51,10 +52,16 @@ def analyze_layout_image(
             flattened = Image.new("RGBA", rgba.size, "white")
             flattened.alpha_composite(rgba)
             image = flattened.convert("RGB")
+            # 아래 두 snap 은 같은 이미지의 어두운 픽셀 투영(전 픽셀 파이썬
+            # 루프)에서 선 후보를 뽑는다. 예전에는 각자 계산해 한 번의 분석이
+            # 같은 투영을 두 번 돌았다(픽스처 실측 137~234ms 중복). 여기서
+            # 한 번 계산해 둘에 넘긴다 — 값이 같으니 결과는 바뀌지 않는다.
+            layout_lines = detect_layout_lines_from_image(image)
             rows, columns = snap_layout_breakpoints_from_image(
                 image,
                 block.row_breakpoints,
                 block.column_breakpoints,
+                layout_lines,
             )
             rows = snap_filled_region_rows(
                 image,
@@ -77,6 +84,7 @@ def analyze_layout_image(
                 block,
                 rows,
                 columns,
+                layout_lines,
             )
             snapped = block.model_copy(
                 update={

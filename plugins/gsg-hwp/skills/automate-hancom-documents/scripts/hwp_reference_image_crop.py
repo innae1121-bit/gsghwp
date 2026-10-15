@@ -11,6 +11,7 @@ from pydantic import Field
 
 from hwp_live_values import ContractModel
 from hwp_reference_image_analyzer import analyze_reference_image, default_artifact_root
+from hwp_reference_image_artifacts import ARTIFACT_IMAGE_SUFFIX, save_artifact_image
 from hwp_reference_image_cache import (
     DEFAULT_REFERENCE_IMAGE_LIMITS,
     ReferenceImageResourceLimits,
@@ -138,7 +139,7 @@ def _save_boundary_overlay(
                 stroke_width=1,
                 stroke_fill=(255, 255, 255, 255),
             )
-        overlay.save(path, format="PNG", optimize=False)
+        save_artifact_image(overlay, path)
 
 
 def prepare_reference_image_crops(
@@ -206,16 +207,16 @@ def prepare_reference_image_crops(
                     output_pixels += crop_width * crop_height
                     if output_pixels > limits.max_source_pixels * 2:
                         raise ValueError("prepared image crops exceed the output pixel limit")
-                    path = temporary / f"crop-{index:02d}.png"
+                    path = temporary / f"crop-{index:02d}{ARTIFACT_IMAGE_SUFFIX}"
                     with image.crop((box.left, box.top, box.right, box.bottom)) as cropped:
-                        cropped.save(path, format="PNG", optimize=False)
+                        save_artifact_image(cropped, path)
                     prepared.append(
                         (request, requested_box, box, boundary, _sha256(path))
                     )
                 _save_boundary_overlay(
                     image,
                     prepared,
-                    temporary / "crop-boundaries.png",
+                    temporary / f"crop-boundaries{ARTIFACT_IMAGE_SUFFIX}",
                 )
         _ = temporary.replace(directory)
     except Exception:
@@ -238,7 +239,7 @@ def prepare_reference_image_crops(
             needs_review=boundary.needs_review,
             component_count=boundary.component_count,
             image_sha256=image_hash,
-            path=directory / f"crop-{index:02d}.png",
+            path=directory / f"crop-{index:02d}{ARTIFACT_IMAGE_SUFFIX}",
         )
         for index, (request, requested_box, box, boundary, image_hash) in enumerate(
             prepared,
@@ -253,6 +254,6 @@ def prepare_reference_image_crops(
         analysis_id=analysis.analysis_id,
         analysis_overlay_path=analysis.overlay_path,
         contact_sheet_paths=analysis.contact_sheet_paths,
-        crop_overlay_path=directory / "crop-boundaries.png",
+        crop_overlay_path=directory / f"crop-boundaries{ARTIFACT_IMAGE_SUFFIX}",
         crops=results,
     )

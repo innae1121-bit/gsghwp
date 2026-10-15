@@ -42,6 +42,12 @@ HWP_FORMAT_TABLE_DESCRIPTION: Final = (
     "instance_id나 후보 ID는 target: {\"target_id\": \"...\"} 형식으로 받습니다. "
     "일반 선택 글자 서식은 hwp_format_text를 사용하며 대상 표가 여러 개면 실제 후보를 반환합니다."
 )
+HWP_SET_TABLE_SIZE_FIXED_DESCRIPTION: Final = (
+    "기존 HWP 표 개체 속성의 크기 고정을 설정합니다. fixed=true는 고정, false는 해제입니다. "
+    "target.target_id에 검사한 표 instance_id를 지정하거나 현재 선택 표를 사용합니다. "
+    "선택 표의 HWPML SIZE.Protect를 되읽어 설정값과 다른 표 속성·크기·내용 및 페이지 수 보존을 검증합니다. "
+    "이미 요청값이면 다시 토글하지 않습니다."
+)
 HWP_MERGE_TABLE_CELLS_DESCRIPTION: Final = (
     "기존 HWP 표의 직사각형 셀 범위를 병합합니다. "
     "실제 셀 span과 오른쪽·아래 이웃을 검사해 빈틈 없는 직사각형일 때만 실행합니다. "

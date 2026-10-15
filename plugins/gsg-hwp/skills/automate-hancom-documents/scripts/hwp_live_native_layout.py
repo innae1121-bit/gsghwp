@@ -63,7 +63,7 @@ from hwp_reference_layout_geometry import (
 from hwp_reference_layout_native import compile_reference_layout_command
 from hwp_reference_layout_patch import (
     ReferenceLayoutPatchBlock,
-    compile_reference_layout_patch_command,
+    compile_reference_layout_patch_commands,
 )
 
 
@@ -442,8 +442,8 @@ def build_native_layout_request(
                     raise HwpLiveError(
                         "참조 이미지 부분 보정에는 현재 구역 용지 정보가 필요합니다"
                     )
-                commands.append(
-                    compile_reference_layout_patch_command(
+                commands.extend(
+                    compile_reference_layout_patch_commands(
                         block,
                         context.page_geometry,
                         page_number=context.page_number,

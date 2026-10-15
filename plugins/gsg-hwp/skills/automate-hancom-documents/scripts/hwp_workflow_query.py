@@ -38,6 +38,7 @@ from hwp_office_xlsx import (
     sheet_inventory,
 )
 from hwp_office_xlsx_safety import XlsxReadLimits
+from hwp_workflow_row_evidence import WorksheetRows, worksheet_matches
 
 if TYPE_CHECKING:
     from hwp_workflow_query_contract import (
@@ -297,30 +298,12 @@ def _source_sha256(source: BinaryIO) -> str:
         _ = source.seek(position)
 
 
-def _normalized_district_key(value: str) -> str:
-    normalized = "".join(value.split())
-    return normalized[:-1] if normalized.endswith("구") else normalized
-
-
-_DATA_NUMBER_TRANSLATION = str.maketrans("", "", ",.()%+-")
-
-
-def _looks_like_data_row(row: Mapping[int, str]) -> bool:
-    values = tuple(value for value in row.values() if value)
-    if not values:
-        return False
-    numeric = 0
-    for value in values:
-        candidate = "".join(value.split()).translate(_DATA_NUMBER_TRANSLATION)
-        numeric += not candidate or candidate.isdecimal()
-    return numeric * 2 >= len(values)
-
-
 def read_workbook_rows(
     paths: tuple[Path, ...],
     *,
     key: str,
     columns: tuple[str, ...] = (),
+    sheet_queries: tuple[str, ...] = (),
     limits: WorkflowLimits | None = None,
 ) -> Mapping[str, JsonValue]:
     """Read each workbook once and return only rows containing the requested key."""
@@ -336,8 +319,20 @@ def read_workbook_rows(
             sheets = sheet_inventory(archive, xlsx_limits)
             if len(sheets) > active_limits.sheets_per_workbook:
                 raise ValueError("workbook sheet limit exceeded")
+            normalized_queries = tuple(
+                "".join(query.split()).casefold() for query in sheet_queries
+            )
+            selected_sheets = tuple(
+                sheet
+                for sheet in sheets
+                if not normalized_queries
+                or any(
+                    query in "".join(sheet.name.split()).casefold()
+                    for query in normalized_queries
+                )
+            )
             matches: list[JsonValue] = []
-            for sheet in sheets:
+            for sheet in selected_sheets:
                 rows = tuple(
                     iter_xlsx_rows(
                         archive,
@@ -351,64 +346,23 @@ def read_workbook_rows(
                     )
                 )
                 merges = merged_ranges(archive, sheet, xlsx_limits)
-                prior_rows: list[tuple[int, Mapping[int, str]]] = []
-                header: tuple[int, Mapping[int, str]] | None = None
-                labels: Mapping[int, str] = {}
-                label_sources: Mapping[int, str] = {}
-                for row in rows:
-                    sparse = dict(row.values)
-                    if not any(
-                        _normalized_district_key(value) == _normalized_district_key(key)
-                        for value in sparse.values()
-                    ):
-                        prior_rows.append((row.index, sparse))
-                        continue
-                    if header is None:
-                        empty_header: tuple[int, Mapping[int, str]] = (0, {})
-                        header = next(
-                            (
-                                candidate
-                                for candidate in reversed(prior_rows)
-                                if candidate[1]
-                                and not _looks_like_data_row(candidate[1])
-                            ),
-                            empty_header,
-                        )
-                        labels, label_sources = _merged_header_labels(
-                            header[0], header[1], merges
-                        )
-                    values: dict[str, JsonValue] = {}
-                    ordered_values: list[JsonValue] = []
-                    merged_labels: list[JsonValue] = []
-                    duplicate_label = False
-                    for index, value in sorted(sparse.items()):
-                        label = labels.get(index, f"column_{index + 1}")
-                        if value and (not columns or label in columns):
-                            duplicate_label = duplicate_label or label in values
-                            values[label] = value
-                            ordered_values.append([label, value])
-                            reference = label_sources.get(index)
-                            if reference is not None:
-                                merged_labels.append(
-                                    {
-                                        "column": index + 1,
-                                        "label": label,
-                                        "merged_from": reference,
-                                    }
-                                )
-                    match: dict[str, JsonValue] = {
-                        "sheet": sheet.name,
-                        "row": row.index,
-                        "values": values,
-                    }
-                    if duplicate_label:
-                        match["ordered_values"] = ordered_values
-                    if merged_labels:
-                        # 이 라벨은 시트에 적혀 있지 않았고 병합에서 왔다.
-                        match["merged_labels"] = merged_labels
-                    matches.append(match)
-                    prior_rows.append((row.index, sparse))
-            output.append({"path": str(path.resolve()), "matches": matches})
+                matches.extend(
+                    worksheet_matches(
+                        WorksheetRows(
+                            sheet.name, rows, merges, active_limits.columns_per_query
+                        ),
+                        key,
+                        columns,
+                    )
+                )
+            output.append(
+                {
+                    "path": str(path.resolve()),
+                    "actual_sheets": [sheet.name for sheet in sheets],
+                    "matched_sheets": [sheet.name for sheet in selected_sheets],
+                    "matches": matches,
+                }
+            )
     result = _JSON_OBJECT.validate_python({"key": key, "workbooks": output})
     if len(_canonical_json(result).encode()) > active_limits.output_utf8_bytes:
         raise ValueError("output UTF-8 byte limit exceeded")

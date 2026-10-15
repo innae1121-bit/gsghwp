@@ -11,7 +11,11 @@ from hwp_document_style_profile import (
     resolve_layout_style_profile,
 )
 from hwp_errors import HwpLiveError
-from hwp_layout_preflight import preflight_layout
+from hwp_layout_preflight import (
+    LAYOUT_MESSAGE_FIELD_LIMIT,
+    preflight_layout,
+    reference_text_fit_message_fact,
+)
 from hwp_live_api import ShapeValue
 from hwp_live_caption import (
     caption_format_sources,
@@ -20,7 +24,7 @@ from hwp_live_caption import (
 from hwp_live_contract import DocumentStyleList, LayoutPlan, PageBreakBlock
 from hwp_live_document_edit_commands import build_delete_page_commands
 from hwp_live_inspection import inspect_styles
-from hwp_live_layout import prepare_layout_assets
+from hwp_live_layout import observed_table_structure, prepare_layout_assets
 from hwp_live_native_action_contract import (
     NativeActionFailure,
     NativeActionFailureEvidence,
@@ -362,6 +366,25 @@ def native_style_plan(
             )
             else None
         )
+        # The setup page is the existing page whose section governs this write,
+        # and it is the page whose tables may be observed. ``layout_page`` is
+        # not usable here: for target="after_page" it is setup_page + 1, a page
+        # this call is about to create, so it has no tables to learn from.
+        #
+        # The caption search above also reads a native structure, but not one
+        # that can be reused: it walks *backwards* from the setup page until it
+        # finds a hierarchical caption, so the structure it ends on usually
+        # belongs to an earlier page, and it returns a caption source rather
+        # than the snapshot. A one-page-wide cell sample from the wrong page is
+        # exactly the contamination this must not introduce, so the structure
+        # is read for the page that is actually being written.
+        structure = observed_table_structure(
+            wrapper,
+            candidate,
+            plan,
+            guard,
+            page=setup_page,
+        )
     finally:
         release_wrapper(wrapper)
     geometry = SectionPageGeometry.from_mm(
@@ -386,6 +409,7 @@ def native_style_plan(
         fallback_style_id=style_id,
         content_width_mm=content_width_mm,
         usage=usage,
+        structure=structure,
     )
     # Additive fact on the existing notice channel: a paragraph that resolved
     # to an automatically numbered style is relying on a marker no command in
@@ -806,6 +830,21 @@ def operate_layout(
     if style_notice:
         separator = " " if message.endswith((".", "!", "?")) else ". "
         message = f"{message}{separator}{style_notice}"
+    # 참조 레이아웃의 텍스트 맞춤이 선언된 글자 크기·장평·자간·줄간격·여백을
+    # 실제로 줄였다는 사실을, 위의 사전 검사가 이미 잰 그대로 옮겨 싣는다.
+    # 그러지 않으면 이 응답 어디에도 "줄였다"가 없어, 모델은 렌더를 눈으로 볼
+    # 때까지 9pt 로 시킨 글이 6.75pt·장평 50% 로 들어갔다는 것을 알 수 없다.
+    # 줄인 게 없으면 아무것도 붙지 않는다.
+    #
+    # 메시지가 다 자란 뒤 마지막에 붙이는 이유는 message 의 4,000자 계약 상한
+    # 이다 -- 남은 자리를 정확히 알아야 사실을 잘라 넣을지 말지를 정직하게
+    # 정할 수 있다.
+    fit_fact = reference_text_fit_message_fact(
+        getattr(preflight, "estimate_basis", ()),
+        budget=LAYOUT_MESSAGE_FIELD_LIMIT - len(message) - 1,
+    )
+    if fit_fact:
+        message = f"{message} {fit_fact}"
     changed_pages = set(
         page_growth_evidence(
             before_page_count=before.page_count,

@@ -346,9 +346,13 @@ class HwpPublicRestructureTools:
         for table in first.tables:
             if table.control_instance_id == table_id:
                 return table
-        for page in range(1, first.page_count + 1):
-            if page == first.page:
-                continue
+        # Reflow normally moves a table to a neighbouring page. Do not restart
+        # a detailed document scan at page one for every copy and verification.
+        pages = sorted(
+            (page for page in range(1, first.page_count + 1) if page != first.page),
+            key=lambda page: (abs(page - first.page), page < first.page),
+        )
+        for page in pages:
             structure = await self._executor.read_table_structure(document_path, page)
             for table in structure.tables:
                 if table.control_instance_id == table_id:
@@ -509,7 +513,7 @@ class HwpPublicRestructureTools:
             state.document_path, state.source_table_id, state.source_page
         )
         verified_table = await self._find_table(
-            state.document_path, state.final_table_id, state.source_page
+            state.document_path, state.final_table_id, final_table.page_start
         )
         source_pictures = (
             ()
@@ -847,9 +851,22 @@ class HwpPublicRestructureTools:
             )
         explicit_labels = None if labels is None else tuple(labels)
         label_values: dict[str, str] = {}
+        consumed_text_cells: set[str] = set()
         for index, item in enumerate(mapping):
             if item.label_cell is None:
                 continue
+            source_address = item.source_cell.upper()
+            source_row, source_column = _address_key(source_address)
+            source_label = source_cells.get(
+                _address(source_column - 1, source_row), source_cells[source_address]
+            )
+            # A replacement label accounts for the old label, not unrelated prose.
+            if (
+                explicit_labels is None
+                or not source_label.has_picture
+                or source_label.address == source_address
+            ):
+                consumed_text_cells.add(source_label.address)
             if explicit_labels is not None:
                 if index >= len(explicit_labels):
                     return _failed(
@@ -860,19 +877,30 @@ class HwpPublicRestructureTools:
                     )
                 label_values[item.label_cell.upper()] = explicit_labels[index]
             else:
-                source_address = item.source_cell.upper()
-                source_row = int("".join(c for c in source_address if c.isdigit()))
-                source_column = "".join(c for c in source_address if c.isalpha())
-                label_values[item.label_cell.upper()] = source_cells.get(
-                    f"{source_column}{source_row + 1}",
-                    source_cells[source_address],
-                ).text
+                label_values[item.label_cell.upper()] = source_label.text
         if explicit_labels is not None and len(explicit_labels) != len(mapping):
             return _failed(
                 operation_id,
                 "labels 개수는 배치할 사진 수와 같아야 합니다.",
                 modified=False,
                 source_table_id=source_id,
+            )
+        unmapped_text = tuple(
+            cell.address
+            for cell in source_table.cells
+            if cell.owner_address == cell.address
+            and cell.text.strip()
+            and cell.address not in consumed_text_cells
+        )
+        if unmapped_text:
+            return _failed(
+                operation_id,
+                "사진 재구성에 포함되지 않는 본문 셀이 있어 문서를 변경하지 않았습니다: "
+                + ", ".join(unmapped_text)
+                + ". 기존 표의 셀 입력은 hwp_fill_table을 사용하세요.",
+                modified=False,
+                source_table_id=source_id,
+                needs_input=True,
             )
         caption = None if source_table.caption is None else source_table.caption.text
         covered_cells = {
@@ -935,7 +963,16 @@ class HwpPublicRestructureTools:
         for item in mapping:
             picture = picture_by_cell[item.source_cell.upper()]
             ratio = (picture.width_mm or 1) / (picture.height_mm or 1)
-            width = photo_width_mm or widths[_address_key(item.photo_cell)[1] - 1]
+            row, column = _address_key(item.photo_cell)
+            span = next(
+                (
+                    merge.column_span
+                    for merge in layout.merges
+                    if merge.row == row - 1 and merge.column == column - 1
+                ),
+                1,
+            )
+            width = photo_width_mm or sum(widths[column - 1 : column - 1 + span])
             height = photo_height_mm or width / ratio
             if photo_width_mm is None and photo_height_mm is not None:
                 width = photo_height_mm * ratio

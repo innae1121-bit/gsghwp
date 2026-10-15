@@ -37,6 +37,10 @@ bool DecodeUtf8Base64(const std::wstring& encoded, std::wstring* const decoded) 
     if (decoded == nullptr) {
         return false;
     }
+    if (encoded.empty()) {
+        decoded->clear();
+        return true;
+    }
     DWORD byteCount = 0;
     if (!CryptStringToBinaryW(
             encoded.c_str(),
@@ -354,6 +358,28 @@ bool ParseRequest(
                 DecodeUtf8Base64(fields[2], &command.second)) {
                 command.kind = CommandKind::ReplaceSelection;
             } else if (fields[0] == L"PREPARE_TEXT" &&
+                fields.size() == 9 && fields[1] == L"LITERAL_RANGE" &&
+                ParseLong(fields[2], &command.list) && command.list >= 0 &&
+                ParseLong(fields[3], &command.paragraph) && command.paragraph >= 0 &&
+                ParseLong(fields[4], &command.character) && command.character >= 0 &&
+                ParseLong(fields[5], &command.endCharacter) &&
+                DecodeUtf8Base64(fields[6], &command.paragraphText) &&
+                DecodeUtf8Base64(fields[7], &command.first) && !command.first.empty() &&
+                DecodeUtf8Base64(fields[8], &command.second) &&
+                command.endCharacter > command.character &&
+                static_cast<size_t>(command.endCharacter) <= command.paragraphText.size() &&
+                command.paragraphText.find_first_of(L"\r\n") == std::wstring::npos &&
+                command.paragraphText.substr(command.character,
+                    command.endCharacter - command.character) == command.first) {
+                command.kind = CommandKind::TextPatch;
+                command.name = L"RANGE";
+                command.endList = command.list;
+                command.endParagraph = command.paragraph;
+                command.preflightOnly = true;
+                command.hasExpectedText = true;
+                command.matchCase = true;
+                command.literalRange = true;
+            } else if (fields[0] == L"PREPARE_TEXT" &&
                 fields.size() == 9 &&
                 fields[1] == L"RANGE" &&
                 ParseLong(fields[2], &command.list) &&
@@ -439,7 +465,7 @@ bool ParseRequest(
                 !command.tableInstanceId.empty() && !fields[3].empty() &&
                 ParseLong(fields[4], &command.occurrence) &&
                 ParseBoolean(fields[5], &command.matchCase) &&
-                DecodeUtf8Base64(fields[6], &command.first) && !command.first.empty() &&
+                DecodeUtf8Base64(fields[6], &command.first) &&
                 DecodeUtf8Base64(fields[7], &command.second) &&
                 (fields.size() == 8 ||
                  ParseBoolean(fields[8], &command.preserveFormat))) {

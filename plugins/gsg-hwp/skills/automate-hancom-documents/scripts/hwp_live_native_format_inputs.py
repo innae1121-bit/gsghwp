@@ -66,7 +66,19 @@ _BORDER_WIDTHS: Final[dict[float, BorderWidth]] = {
     5.0: "5.0mm",
 }
 _TEXT_KEYS: Final = frozenset(
-    ("bold", "font_name", "font_size_pt", "text_color", "alignment", "line_spacing")
+    (
+        "bold",
+        "font_name",
+        "font_size_pt",
+        "text_color",
+        "alignment",
+        "line_spacing",
+        "letter_spacing_percent",
+        "left_margin_mm",
+        "indentation_mm",
+        "keep_with_next",
+        "page_break_before",
+    )
 )
 # 서식 값이 아니라 "어느 텍스트인가" 를 적어 두는 이름들이다
 # (hwp_public_selection_tools._text_patch_parameters 가 만든다). 허용 목록에
@@ -88,10 +100,22 @@ _TARGETING_KEYS: Final = frozenset(
         "table_instance_id",
     )
 )
-_TABLE_KEYS: Final = _TEXT_KEYS | frozenset(
+_TABLE_KEYS: Final = (
+    _TEXT_KEYS
+    - {
+        "letter_spacing_percent",
+        "left_margin_mm",
+        "indentation_mm",
+        "keep_with_next",
+        "page_break_before",
+    }
+) | frozenset(
     (
         "cell",
         "cells",
+        "protect_size",
+        "format_source_table_id",
+        "format_source_cell",
         "row_height_mm",
         "column_width_mm",
         "padding_left_mm",
@@ -103,6 +127,7 @@ _TABLE_KEYS: Final = _TEXT_KEYS | frozenset(
         "border_style",
         "border_width",
         "border_color",
+        "border_sides",
     )
 )
 
@@ -122,6 +147,11 @@ class TextFormatSpec:
     text_color: Rgb | None
     alignment: Alignment
     line_spacing: int | None
+    letter_spacing_percent: int | None = None
+    left_margin_mm: float | None = None
+    indentation_mm: float | None = None
+    keep_with_next: bool | None = None
+    page_break_before: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +163,9 @@ class TableFormatSpec:
     # 여러 셀을 한 요청에 담을 때 실제로 적용할 주소들이다. 'A4:P4' 같은 구간은
     # 여기서 이미 펼쳐진 상태이고, cell 하나만 온 요청은 그 하나가 들어온다.
     cells: tuple[str, ...] = ()
+    protect_size: bool | None = None
+    format_source_table_id: str | None = None
+    format_source_cell: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,18 +402,50 @@ def parse_text_format(
     )
     if alignment is None:
         return InputFailure("schema_conflict", "문단 정렬 값이 올바르지 않습니다")
+    letter_spacing = (
+        None
+        if "letter_spacing_percent" not in parameters
+        else _integer(parameters.get("letter_spacing_percent"), -50, 50)
+    )
+    left_margin = _number(parameters.get("left_margin_mm"))
+    indentation = _number(parameters.get("indentation_mm"))
+    keep_next = _boolean(parameters.get("keep_with_next"))
+    page_break = _boolean(parameters.get("page_break_before"))
     invalid = (
         ("bold" in parameters and bold is None)
         or ("font_name" in parameters and font_name is None)
         or ("font_size_pt" in parameters and font_size is None)
         or ("text_color" in parameters and color is None)
         or ("line_spacing" in parameters and spacing is None)
+        or ("letter_spacing_percent" in parameters and letter_spacing is None)
+        or (
+            "left_margin_mm" in parameters
+            and (left_margin is None or not 0 <= left_margin <= 200)
+        )
+        or (
+            "indentation_mm" in parameters
+            and (indentation is None or not -200 <= indentation <= 200)
+        )
+        or ("keep_with_next" in parameters and keep_next is None)
+        or ("page_break_before" in parameters and page_break is None)
     )
     if invalid:
         return InputFailure(
             "schema_conflict", "글자·문단 서식 입력 형식이나 범위가 올바르지 않습니다"
         )
-    return TextFormatSpec(bold, font_name, font_size, color, alignment, spacing)
+    return TextFormatSpec(
+        bold,
+        font_name,
+        font_size,
+        color,
+        alignment,
+        spacing,
+        letter_spacing,
+        left_margin_mm=left_margin,
+        indentation_mm=indentation,
+        keep_with_next=keep_next,
+        page_break_before=page_break,
+    )
 
 
 def parse_table_format(
@@ -391,6 +456,17 @@ def parse_table_format(
     )
     if unknown is not None:
         return unknown
+    if "protect_size" in parameters:
+        protect_size = _boolean(parameters["protect_size"])
+        if protect_size is None:
+            return InputFailure(
+                "schema_conflict", "크기 고정은 true 또는 false여야 합니다"
+            )
+        if set(parameters) != {"protect_size"}:
+            return InputFailure(
+                "schema_conflict", "표 개체 크기 고정은 셀 서식과 별도 호출해야 합니다"
+            )
+        return TableFormatSpec(None, TableCell(), None, None, protect_size=protect_size)
     cell = _address(parameters.get("cell"))
     cells: tuple[str, ...] = () if cell is None else (cell,)
     if "cells" in parameters:
@@ -403,6 +479,36 @@ def parse_table_format(
             )
         # cell 과 cells 가 같이 오면 겹치는 주소를 두 번 방문하지 않는다.
         cells = tuple(dict.fromkeys((*cells, *expanded)))
+    if "format_source_table_id" in parameters or "format_source_cell" in parameters:
+        source_id = parameters.get("format_source_table_id")
+        source_cell = _address(parameters.get("format_source_cell"))
+        if not isinstance(source_id, str) or not source_id or source_cell is None:
+            return InputFailure(
+                "schema_conflict", "서식 원본의 표 ID와 실제 셀 주소가 필요합니다"
+            )
+        if not cells:
+            return InputFailure(
+                "needs_input", "서식 복사는 대상 cell 또는 cells가 필요합니다"
+            )
+        if set(parameters) - {
+            "cell",
+            "cells",
+            "format_source_table_id",
+            "format_source_cell",
+        }:
+            return InputFailure(
+                "schema_conflict",
+                "원본 서식 복사와 개별 서식 지정은 함께 사용할 수 없습니다",
+            )
+        return TableFormatSpec(
+            cell,
+            TableCell(),
+            None,
+            None,
+            cells=cells,
+            format_source_table_id=source_id,
+            format_source_cell=source_cell,
+        )
     format_parameters = {
         name: value for name, value in parameters.items() if name in _TEXT_KEYS
     }
@@ -485,6 +591,25 @@ def parse_table_format(
     has_border = any(
         name in parameters for name in ("border_color", "border_style", "border_width")
     )
+    border_sides = ("left", "right", "top", "bottom")
+    if "border_sides" in parameters:
+        raw_sides = parameters["border_sides"]
+        if not isinstance(raw_sides, str):
+            return InputFailure(
+                "schema_conflict", "테두리 변은 left/right/top/bottom이어야 합니다"
+            )
+        border_sides = tuple(dict.fromkeys(raw_sides.split(",")))
+        if (
+            not has_border
+            or not border_sides
+            or any(
+                side not in {"left", "right", "top", "bottom"} for side in border_sides
+            )
+        ):
+            return InputFailure(
+                "schema_conflict",
+                "테두리 변과 적용할 테두리 서식을 함께 지정해야 합니다",
+            )
     if ("fill_color" in parameters and fill is None) or border_color is None:
         return InputFailure("schema_conflict", "셀 색상 값이 올바르지 않습니다")
     if border_style not in _BORDER_STYLES:
@@ -509,7 +634,7 @@ def parse_table_format(
     borders = None
     if has_border:
         border = CellBorder(style=border_style, width=border_width, color=border_color)
-        borders = CellBorders(left=border, right=border, top=border, bottom=border)
+        borders = CellBorders.model_validate({side: border for side in border_sides})
     return TableFormatSpec(
         cell,
         TableCell(

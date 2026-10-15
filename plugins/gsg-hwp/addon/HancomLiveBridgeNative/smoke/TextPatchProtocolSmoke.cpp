@@ -59,5 +59,22 @@ bool TextPatchProtocolSmoke() {
                << L"TEXT_PATCH_PREPARED_CELL_PROTOCOL " << cell << L'\n'
                << L"TEXT_PATCH_FORWARD_EXPECTED_B64 b2xk\n"
                << L"TEXT_PATCH_INVERSE_EXPECTED_B64 bmV3\n";
-    return range && cell;
+    hancom::actions::Command emptyCommand;
+    const bool emptyCell = ParseOne(
+        L"PATCH_TEXT\tCELL\tdGFibGUtMQ==\tA1\t0\t0\t\tbmV3", &emptyCommand) &&
+        emptyCommand.hasExpectedText && emptyCommand.first.empty();
+    const bool emptyFindRejected = !ParseOne(
+        L"PATCH_TEXT\tFIND\tdGFibGUtMQ==\tA1\t0\t0\t\tbmV3", &emptyCommand);
+    std::wcout << L"TEXT_PATCH_EMPTY_CELL_PROTOCOL " << emptyCell << L'\n'
+               << L"TEXT_PATCH_EMPTY_FIND_REJECTED " << emptyFindRejected << L'\n';
+    hancom::actions::Command literal;
+    const bool literalRange = ParseOne(
+        L"PREPARE_TEXT\tLITERAL_RANGE\t0\t1\t4\t7\tdGhlIG9sZA==\tb2xk\tbmV3", &literal) &&
+        literal.literalRange && literal.preflightOnly && literal.hasExpectedText &&
+        literal.paragraphText == L"the old" && literal.first == L"old";
+    const bool badLiteral = !ParseOne(
+        L"PREPARE_TEXT\tLITERAL_RANGE\t0\t1\t0\t3\tdGhlIG9sZA==\tb2xk\tbmV3", &literal);
+    std::wcout << L"TEXT_PATCH_LITERAL_RANGE_PROTOCOL " << literalRange << L'\n'
+               << L"TEXT_PATCH_LITERAL_CONTEXT_GUARD " << badLiteral << L'\n';
+    return range && cell && emptyCell && emptyFindRejected && literalRange && badLiteral;
 }

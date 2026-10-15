@@ -21,11 +21,13 @@ from hwp_public_cell_selector import (
 from hwp_public_contract import PublicActionResult, PublicTableTarget
 from hwp_public_contract import refresh_public_target_ids, to_public_action_result
 from hwp_public_table_edit_contract import (
+    PublicCellFormatSource,
     PublicMergeTableCellsInput,
     PublicSplitTableCellInput,
     PublicTableAlignment,
     PublicTableBorderStyle,
     PublicTableBorderWidth,
+    PublicTableBorderSide,
     PublicTableColor,
     PublicTableFormattingInput,
     PublicTableSplitMode,
@@ -138,6 +140,20 @@ class HwpPublicTableEditTools:
         border_style: PublicTableBorderStyle | None = None,
         border_width: PublicTableBorderWidth | None = None,
         border_color: PublicTableColor | None = None,
+        border_sides: Annotated[
+            tuple[PublicTableBorderSide, ...] | None,
+            Field(
+                min_length=1,
+                max_length=4,
+                description="테두리를 변경할 셀 변입니다. 생략하면 네 변 모두 적용하며, 지정하지 않은 변은 보존합니다.",
+            ),
+        ] = None,
+        format_source: Annotated[
+            PublicCellFormatSource | None,
+            Field(
+                description="원본 셀 첫 문단의 글자·문단 모양을 대상 셀 전체에 복사합니다. 대상 cell/cells가 필요하며 개별 서식과 함께 지정할 수 없습니다."
+            ),
+        ] = None,
     ) -> PublicActionResult:
         request = PublicTableEditResolutionRequest(
             resolution=PublicTableResolutionRequest(
@@ -169,8 +185,14 @@ class HwpPublicTableEditTools:
                     border_style=border_style,
                     border_width=border_width,
                     border_color=border_color,
+                    border_sides=border_sides,
                 )
                 parameters = dict(requested.to_parameters())
+                if format_source is not None:
+                    parameters["format_source_table_id"] = (
+                        format_source.table_instance_id
+                    )
+                    parameters["format_source_cell"] = format_source.cell
                 if cells:
                     # OperationInputValue 는 스칼라만 담는다. 구간 전개와 중복
                     # 제거는 parse_table_format 이 한 번에 한다.
@@ -195,6 +217,37 @@ class HwpPublicTableEditTools:
                         postconditions=HwpOperatePostconditions(verify_structure=True),
                     ),
                 )
+
+    async def hwp_set_table_size_fixed(
+        self,
+        *,
+        operation_id: PublicOperationId,
+        target: PublicTableTarget | None = None,
+        fixed: bool = True,
+    ) -> PublicActionResult:
+        request = PublicTableEditResolutionRequest(
+            resolution=PublicTableResolutionRequest(
+                target=target,
+                request_id=operation_id,
+                query=metadata.FORMAT_TABLE_INTENT,
+            ),
+            cells=(),
+        )
+        resolved = await self._resolved(request)
+        if isinstance(resolved, PublicActionResult):
+            return resolved
+        return await self._execute(
+            request.resolution.query,
+            HwpOperateInputs(
+                request_id=operation_id,
+                document=resolved.target.document_path,
+                operation="table.format",
+                target=resolved.target.target,
+                parameters={"protect_size": fixed},
+                policy=HwpOperatePolicy(ambiguity="return_candidates"),
+                postconditions=HwpOperatePostconditions(verify_structure=True),
+            ),
+        )
 
     async def hwp_merge_table_cells(
         self,

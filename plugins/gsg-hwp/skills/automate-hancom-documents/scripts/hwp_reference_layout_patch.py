@@ -10,7 +10,15 @@ from hwp_live_native_action_models import (
     NativeSetter,
     ParameterActionCommand,
     TextValue,
+    CaptureTableCommand,
+    CellCommand,
+    NativeActionCommand,
+    RunCommand,
+    SelectControlCommand,
 )
+from hwp_live_native_layout_format import cell_format_commands
+from hwp_live_table_contract import CellBorder, CellBorders, TableCell
+from hwp_table_address import cell_address
 from hwp_live_values import ContractModel
 from hwp_reference_layout_contract import (
     ReferenceLayoutBlock,
@@ -91,10 +99,7 @@ class ReferenceLayoutPatchBlock(ContractModel):
             or self.text_anchors
         ):
             raise ValueError("reference layout patch has no changes")
-        text_targets = {
-            (anchor.row, anchor.column)
-            for anchor in self.text_anchors
-        }
+        text_targets = {(anchor.row, anchor.column) for anchor in self.text_anchors}
         if len(text_targets) != len(self.text_anchors):
             raise ValueError("text anchor targets must be unique")
         _ = self.combined_styles()
@@ -230,3 +235,86 @@ def compile_reference_layout_patch_command(
             *payload.values,
         ),
     )
+
+
+def compile_reference_layout_patch_commands(
+    patch: ReferenceLayoutPatchBlock,
+    page: SectionPageGeometry,
+    *,
+    page_number: int,
+) -> tuple[NativeActionCommand, ...]:
+    """Apply appearance-only patches without resetting inherited text styles.
+
+    CellBorder writes real cell sides; CellZoneBorder/SelCellsBorderFill can
+    return success while leaving those sides unchanged in existing tables.
+    Keep the native patch topology check, then use the established CellFill
+    and CellBorder actions for the requested owners only.
+    """
+    appearance_only = not (
+        patch.changed_rows or patch.changed_columns or patch.text_anchors
+    ) and all(style.model_fields_set <= {"key", "fill_color"} for style in patch.styles)
+    if not appearance_only:
+        return (
+            compile_reference_layout_patch_command(
+                patch, page, page_number=page_number
+            ),
+        )
+    rows, columns = len(patch.row_breakpoints) - 1, len(patch.column_breakpoints) - 1
+    owners = {(r, c): (r, c) for r in range(rows) for c in range(columns)}
+    for merge in patch.merges:
+        for r in range(merge.row, merge.row + merge.row_span):
+            for c in range(merge.column, merge.column + merge.column_span):
+                owners[r, c] = (merge.row, merge.column)
+    fills = {}
+    styles = {style.key: style for style in patch.styles}
+    for region in patch.style_regions:
+        color = styles[region.style_key].fill_color
+        if color is not None:
+            for r in range(region.top, region.bottom):
+                for c in range(region.left, region.right):
+                    fills[owners[r, c]] = color
+    borders: dict[tuple[int, int], dict[str, CellBorder]] = {}
+    for edge in patch.edges:
+        border = CellBorder(style=edge.style, width=edge.width, color=edge.color)
+        for position in range(edge.start, edge.end):
+            if edge.orientation == "vertical":
+                adjacent = (
+                    (position, edge.line - 1, "right"),
+                    (position, edge.line, "left"),
+                )
+            else:
+                adjacent = (
+                    (edge.line - 1, position, "bottom"),
+                    (edge.line, position, "top"),
+                )
+            for r, c, side in adjacent:
+                if (r, c) in owners:
+                    borders.setdefault(owners[r, c], {})[side] = border
+    topology_check = patch.model_copy(update={"styles": (), "style_regions": ()})
+    commands: list[NativeActionCommand] = []
+    if patch.edges:
+        commands.append(
+            compile_reference_layout_patch_command(
+                topology_check, page, page_number=page_number
+            )
+        )
+    commands.extend(
+        (SelectControlCommand(patch.target_control_id), CaptureTableCommand())
+    )
+    for r, c in sorted(fills.keys() | borders.keys()):
+        cell = TableCell(
+            fill_color=fills.get((r, c)),
+            borders=CellBorders.model_validate(borders[r, c])
+            if (r, c) in borders
+            else None,
+        )
+        commands.extend(
+            (
+                CellCommand(cell_address(r, c)),
+                RunCommand("TableCellBlock"),
+                *cell_format_commands(cell),
+                RunCommand("Cancel"),
+            )
+        )
+    commands.append(RunCommand("Cancel"))
+    return tuple(commands)

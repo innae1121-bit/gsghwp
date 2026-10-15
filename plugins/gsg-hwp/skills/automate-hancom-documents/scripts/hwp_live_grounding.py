@@ -6,7 +6,7 @@ import hashlib
 import json
 from math import isfinite
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 
 from PIL import Image, ImageDraw
 from pydantic import Field, field_validator, model_validator
@@ -202,6 +202,46 @@ class HwpGroundingReport(ContractModel):
         if overlay_pages not in ((), clean_pages):
             raise ValueError("overlay pages must be empty or match clean pages")
         return self
+
+
+# 호출자 하네스는 도구 응답의 **꼬리**를 조용히 자른다. 이 보고서에서 부피를
+# 가진 절은 conventions 하나뿐이다 — 문서 관례 프로필을 통째로 실어 실측
+# 48,087바이트까지 커진다. 나머지 다섯 절(clean_renders·overlays·geometry·
+# provenance·schema_version)은 다 합쳐 몇 KB뿐이고, 그 가운데 clean_renders 는
+# 이 호출을 하는 이유 그 자체다. 선언 순서대로 내보내면 목적물이 48KB 뒤에
+# 놓여 가장 먼저 사라진다.
+#
+# 그래서 **직렬화 순서만** 바꾼다. 모델의 필드 선언 순서는 그대로 두어야 한다:
+# 선언 순서가 곧 outputSchema 의 `required` 배열 순서여서(실측:
+# ["schema_version","provenance","geometry","conventions","clean_renders"]),
+# 선언을 옮기면 봉인된 legacy_tool_schema_hashes["hwp_ground_document"] 가
+# 움직이고 카탈로그·오라클 재봉인 연쇄가 따라온다. JSON 객체의 키 순서는
+# 스키마가 규정하는 값이 아니므로 이 재배치는 계약을 건드리지 않는다.
+GROUNDING_RESPONSE_FIELD_ORDER: Final[tuple[str, ...]] = (
+    "schema_version",
+    "clean_renders",
+    "overlays",
+    "geometry",
+    "provenance",
+    "conventions",
+)
+
+
+def reorder_grounding_payload[JsonNode](
+    payload: dict[str, JsonNode],
+) -> dict[str, JsonNode]:
+    """작은 목적 필드를 conventions 앞에 놓은 직렬화 순서를 만든다.
+
+    목록에 없는 키는 순서를 지킨 채 뒤에 그대로 붙는다 — 필드가 늘어도 이
+    함수가 값을 잃지 않게 하려는 것이다.
+    """
+    ordered = {
+        key: payload[key] for key in GROUNDING_RESPONSE_FIELD_ORDER if key in payload
+    }
+    for key, value in payload.items():
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
 
 
 @dataclass(frozen=True, slots=True)

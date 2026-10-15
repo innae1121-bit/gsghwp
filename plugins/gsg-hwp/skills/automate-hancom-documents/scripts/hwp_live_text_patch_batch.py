@@ -125,6 +125,12 @@ def compile_text_patch_batch(
     minimum_protocol: Literal[11, 12] = 11
     for request in requests:
         target = request.target
+        if request.literal_range is not None and not preflight:
+            raise HwpLiveError(
+                "inspected literal coordinates must be prepared before mutation",
+                mutation_started=False,
+                safe_to_repeat=True,
+            )
         commands.append(
             TextPatchCommand(
                 target=target.kind,
@@ -138,9 +144,15 @@ def compile_text_patch_batch(
                 cell_address=target.cell_address,
                 preflight_only=(
                     preflight
-                    and request.expected_text is None
-                    and target.kind in {"range", "table_cell"}
+                    and (
+                        request.literal_range is not None
+                        or (
+                            request.expected_text is None
+                            and target.kind in {"range", "table_cell"}
+                        )
+                    )
                 ),
+                literal_range=request.literal_range,
             )
         )
         if request.formatting is not None:
@@ -195,16 +207,17 @@ def preflight_text_patch_batch(
                 mutation_started=False,
                 safe_to_repeat=True,
             )
-        forget_cached_content_signatures(candidate.window_handle)
-        current_revision = read_native_content_revision(candidate.window_handle)
-        if current_revision != plan_guard.content_revision:
-            raise HwpLiveError(
-                "text.patch plan content revision이 현재 문서와 다릅니다",
-                mutation_started=False,
-                safe_to_repeat=True,
-            )
     prepared_requests = canonical_prepared_text_patch_requests(requests)
     if prepared_requests is None:
+        if plan_guard is not None:
+            forget_cached_content_signatures(candidate.window_handle)
+            current_revision = read_native_content_revision(candidate.window_handle)
+            if current_revision != plan_guard.content_revision:
+                raise HwpLiveError(
+                    "text.patch plan content revision이 현재 문서와 다릅니다",
+                    mutation_started=False,
+                    safe_to_repeat=True,
+                )
         # A semantic (find/current) member makes the whole batch unpreparable.
         # Any exact target that omitted expected_text then has no way to learn
         # its existing text, and returning None here would hand the batch to the
@@ -451,15 +464,6 @@ def patch_validated_text_batch(
     _validate_batch_verification_shape(execution_requests)
     plan = compile_text_patch_batch(execution_requests)
     planning_elapsed = (perf_counter_ns() - planning_started) // 1_000
-    if prepared is not None:
-        forget_cached_content_signatures(candidate.window_handle)
-        current_revision = read_native_content_revision(candidate.window_handle)
-        if current_revision != prepared.content_revision:
-            raise HwpLiveError(
-                "text.patch prepared receipt 이후 문서 상태가 바뀌었습니다",
-                mutation_started=False,
-                safe_to_repeat=True,
-            )
     require_writable_document(unsafe_selectors, candidate.selector)
     guard()
     readback_started = perf_counter_ns()

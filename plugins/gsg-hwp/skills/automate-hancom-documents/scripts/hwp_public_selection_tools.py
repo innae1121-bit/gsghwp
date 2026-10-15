@@ -1,22 +1,31 @@
 from __future__ import annotations
 
-from typing import Final, final
+import hashlib
+import json
+from typing import Final, Literal, final
 
 import hwp_public_action_metadata as metadata
 from hwp_errors import HwpLiveError
+from hwp_live_native_action_models import LiteralTextRange
 from hwp_operation_contract import (
     HwpOperateInputs,
     HwpOperatePolicy,
     HwpOperatePostconditions,
     HwpOperateTarget,
+    OperationInputValue,
 )
 from hwp_priority_recipe_contract import HwpPriorityRecipeInputs, RecipePosition
+from hwp_public_changed_text import changed_text_requests
 from hwp_public_action_contract import (
     SELECTION_INPUT_ALIASES,
     PublicFontName,
     PublicFontSize,
     PublicExpectedText,
     PublicLineSpacing,
+    PublicLetterSpacing,
+    PublicParagraphMargin,
+    PublicParagraphIndent,
+    PublicSelectionFormattingInput,
     PublicOperationId,
     PublicReplacementText,
     PublicSelectionExecutor,
@@ -34,6 +43,25 @@ from hwp_live_text_patch_contract import TextPatchPlanGuard, TextPatchRequest
 
 
 _REPLACE_SELECTED_TEXT_INTENT: Final = "선택 텍스트 교체"
+_PATCH_BATCH_IDENTITY_KEY: Final = "patch_batch_identity_v1_sha256"
+
+
+def _inspected_literal(request: TextPatchRequest) -> LiteralTextRange | None:
+    start, end = request.target.start, request.target.end
+    text = request.expected_text
+    if (
+        request.target.kind == "range"
+        and start is not None
+        and end is not None
+        and start.character == 0
+        and (start.list_id, start.paragraph) == (end.list_id, end.paragraph)
+        and text
+        and "\r" not in text
+        and "\n" not in text
+        and end.character == len(text.encode("utf-16-le")) // 2
+    ):
+        return LiteralTextRange(text, 0, end.character)
+    return None
 
 
 def _text_patch_parameters(
@@ -78,6 +106,27 @@ def _text_patch_parameters(
         parameters.update(formatting.to_parameters())
     parameters["post_selection"] = post_selection
     return parameters
+
+
+def _text_patch_batch_parameters(
+    patches: PublicTextPatchBatch,
+    formatting: PublicTextFormattingInput | None,
+    format_changed_only: bool,
+) -> dict[str, OperationInputValue]:
+    payload = {
+        "patches": [patch.model_dump(mode="json") for patch in patches],
+        "formatting": (
+            None if formatting is None else formatting.model_dump(mode="json")
+        ),
+        "format_changed_only": format_changed_only,
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return {_PATCH_BATCH_IDENTITY_KEY: hashlib.sha256(canonical).hexdigest()}
 
 
 @final
@@ -137,6 +186,7 @@ class HwpPublicSelectionTools:
         operation_id: PublicOperationId,
         patches: PublicTextPatchBatch,
         formatting: PublicTextFormattingInput | None = None,
+        format_changed_only: bool = False,
         document_path: str | None = None,
         expected_document_id: int | None = None,
         expected_document_full_name: str | None = None,
@@ -166,45 +216,47 @@ class HwpPublicSelectionTools:
                 expected_content_revision,
             )
         )
-        parameters: dict[str, str | int | float | bool] = {}
-        requests: list[TextPatchRequest] = []
         live_formatting = None if formatting is None else formatting.to_live()
-        for index, patch in enumerate(patches):
-            item_parameters = _text_patch_parameters(
-                patch.target,
-                replacement=patch.replacement,
-                expected_text=patch.expected_text,
-                formatting=None,
+        if format_changed_only:
+            if live_formatting is None:
+                raise HwpLiveError(
+                    "changed-only batch requires shared formatting",
+                    mutation_started=False,
+                    safe_to_repeat=True,
+                )
+            requests = changed_text_requests(
+                patches, live_formatting, inspected=plan_guard is not None
             )
-            parameters.update(
-                {
-                    f"patches.{index}.{key}": value
-                    for key, value in item_parameters.items()
-                }
-            )
-            live_patch = patch.to_live()
-            requests.append(
+        else:
+            requests = tuple(
                 TextPatchRequest(
                     target=live_patch.target,
                     expected_text=live_patch.expected_text,
                     replacement=live_patch.replacement,
                     formatting=live_formatting,
+                    literal_range=(
+                        _inspected_literal(live_patch)
+                        if plan_guard is not None
+                        else None
+                    ),
                 )
+                for patch in patches
+                for live_patch in (patch.to_live(),)
             )
-        if formatting is not None:
-            parameters.update(formatting.to_parameters())
         inputs = HwpOperateInputs(
             request_id=operation_id,
             document=document_path,
             operation="text.replace",
-            parameters=parameters,
+            parameters=_text_patch_batch_parameters(
+                patches, formatting, format_changed_only
+            ),
             policy=HwpOperatePolicy(ambiguity="return_candidates"),
             postconditions=HwpOperatePostconditions(verify_structure=True),
         )
         result = await self._executor.patch_text_batch(
             metadata.PATCH_TEXT_BATCH_INTENT,
             inputs,
-            tuple(requests),
+            requests,
             plan_guard,
         )
         return to_public_action_result(result, (), SELECTION_INPUT_ALIASES)
@@ -263,17 +315,33 @@ class HwpPublicSelectionTools:
         self,
         *,
         operation_id: PublicOperationId,
-        style_id: PublicStyleId,
+        style_id: PublicStyleId | None = None,
         target_position: PublicTextPatchPosition | None = None,
+        source_position: PublicTextPatchPosition | None = None,
+        style_copy_type: Literal[0, 1, 2, 3, 4] = 2,
         document_path: str | None = None,
     ) -> PublicActionResult:
+        if (style_id is None) == (source_position is None):
+            raise ValueError("style_id 또는 source_position 중 하나를 지정하세요")
+        if source_position is not None and target_position is None:
+            raise ValueError("모양 복사에는 target_position이 필요합니다")
         inputs = HwpOperateInputs(
             request_id=operation_id,
             document=document_path,
-            operation="style.apply",
+            operation="style.apply" if source_position is None else "style.copy",
             target=HwpOperateTarget(kind="selection", binding="selection"),
             recipe=HwpPriorityRecipeInputs(
                 style_id=style_id,
+                source_position=(
+                    None
+                    if source_position is None
+                    else RecipePosition(
+                        list_id=source_position.list_id,
+                        paragraph=source_position.paragraph,
+                        character=source_position.character,
+                    )
+                ),
+                style_copy_type=style_copy_type,
                 target_position=(
                     None
                     if target_position is None
@@ -300,18 +368,33 @@ class HwpPublicSelectionTools:
         text_color: PublicTextColor | None = None,
         alignment: PublicTextAlignment = "inherit",
         line_spacing: PublicLineSpacing | None = None,
+        letter_spacing_percent: PublicLetterSpacing | None = None,
+        left_margin_mm: PublicParagraphMargin | None = None,
+        indentation_mm: PublicParagraphIndent | None = None,
+        keep_with_next: bool | None = None,
+        page_break_before: bool | None = None,
         target: PublicTextPatchTarget | None = None,
         expected_text: PublicExpectedText | None = None,
+        whole_body: bool = False,
         document_path: str | None = None,
     ) -> PublicActionResult:
         resolved_target = PublicTextPatchTarget() if target is None else target
-        formatting = PublicTextFormattingInput(
+        if whole_body and (target is not None or expected_text is not None):
+            raise ValueError(
+                "whole_body는 target 또는 expected_text와 함께 사용할 수 없습니다"
+            )
+        formatting = PublicSelectionFormattingInput(
             bold=bold,
             font_name=font_name,
             font_size_pt=font_size_pt,
             text_color=text_color,
             alignment=alignment,
             line_spacing=line_spacing,
+            letter_spacing_percent=letter_spacing_percent,
+            left_margin_mm=left_margin_mm,
+            indentation_mm=indentation_mm,
+            keep_with_next=keep_with_next,
+            page_break_before=page_break_before,
         )
         # 이 두 갈래는 parameters 를 읽는 쪽이 서로 다르다. 선택 갈래는 일반
         # 작업 파이프라인으로 가고 그쪽 parse_text_format 은 parameters 를 "적용할
@@ -331,7 +414,10 @@ class HwpPublicSelectionTools:
                 else None
             ),
             parameters=(
-                dict(formatting.to_parameters())
+                {
+                    **dict(formatting.to_parameters()),
+                    **({"whole_body": True} if whole_body else {}),
+                }
                 if selection_only
                 else _text_patch_parameters(
                     resolved_target,

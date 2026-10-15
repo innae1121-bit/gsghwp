@@ -10,18 +10,22 @@ from pathlib import Path
 from typing import Final, final
 from uuid import uuid4
 
-from pydantic import StrictInt, ValidationError, field_validator
+from pydantic import Field, StrictInt, ValidationError, field_validator
 
 from hwp_document_convention_contract import (
     ConventionCacheMetadata,
     ConventionCacheMissReason,
     DocumentConventionProfile,
 )
+from hwp_live_contract import ObservedDocumentStyle
 from hwp_live_preview_lock import PreviewFileLock
 from hwp_live_values import ContractModel
 from hwp_operation_journal_contract import default_operation_journal_path
 
-_SCHEMA_VERSION: Final = 2
+# 3 은 스타일별 관측(``observed``)을 함께 싣기 시작한 세대다. 2 이하로 적힌
+# 파일에는 그 관측이 없어 적중시켜도 빈 목록밖에 복원하지 못하므로, 버전
+# 검사에서 그대로 떨어뜨려 다시 관측하고 다시 저장하게 둔다.
+_SCHEMA_VERSION: Final = 3
 _MAX_AGE: Final = timedelta(days=7)
 _SAMPLE_BYTES: Final = 1024 * 1024
 _CHEAP_METHOD: Final = "normalized_path+size+mtime_ns"
@@ -35,15 +39,32 @@ class _FileIdentity(ContractModel):
     partial_sha256: str
 
 
+class _PersistentStyleObservation(ContractModel):
+    """관례 요약이 아니라, 스타일별로 실제로 관측한 것 자체.
+
+    ``hwp_list_styles`` 의 ``observed_usage.styles`` 가 그대로 여기 실린다.
+    프로필만 저장하던 시절에는 적중 응답이 이 목록을 복원할 재료가 없어 빈
+    배열을 내보냈다 — 미스 1회차와 적중 2회차의 답이 달랐다.
+
+    ``complete`` 는 프로필의 것과 다르다. 프로필은 문단 순회가 끝까지 갔는지를
+    말하고, 이쪽은 접힌 목록이 상한(64)에서 잘렸는지까지 반영한 값이다. 잘린
+    목록을 완전하다고 말하지 않으려면 관측 당시의 이 값을 그대로 실어야 한다.
+    """
+
+    complete: bool
+    styles: tuple[ObservedDocumentStyle, ...] = Field(default=(), max_length=64)
+
+
 class _PersistentEntry(ContractModel):
     schema_version: StrictInt
     created_at: datetime
     identity: _FileIdentity
     profile: DocumentConventionProfile
+    observed: _PersistentStyleObservation
 
     @field_validator("schema_version")
     @classmethod
-    def require_schema_version_two(cls, value: int) -> int:
+    def require_current_schema_version(cls, value: int) -> int:
         if value != _SCHEMA_VERSION:
             raise ValueError("unsupported convention cache schema")
         return value
@@ -60,6 +81,10 @@ class _PersistentEntry(ContractModel):
 class ConventionCacheLookup:
     profile: DocumentConventionProfile | None
     metadata: ConventionCacheMetadata
+    # 미스에서는 의미가 없다: 부를 쪽이 관측을 새로 하기 때문이다. 적중에서만
+    # 채워지며, 그때는 저장 당시의 목록과 완전성 표시를 그대로 돌려준다.
+    styles: tuple[ObservedDocumentStyle, ...] = ()
+    styles_complete: bool = False
 
 
 def default_convention_cache_root() -> Path:
@@ -192,13 +217,19 @@ class ConventionProfileCache:
             return self._path_miss(path, "content_hash_mismatch", _HASH_METHOD)
         metadata = _metadata(hit=True, method=_HASH_METHOD, created_at=entry.created_at)
         return ConventionCacheLookup(
-            entry.profile.model_copy(update={"cache": metadata}), metadata
+            entry.profile.model_copy(update={"cache": metadata}),
+            metadata,
+            entry.observed.styles,
+            entry.observed.complete,
         )
 
     def store(
         self,
         document: Path,
         profile: DocumentConventionProfile,
+        *,
+        styles: tuple[ObservedDocumentStyle, ...] = (),
+        styles_complete: bool = False,
     ) -> ConventionCacheMetadata:
         try:
             stat = document.stat()
@@ -216,6 +247,10 @@ class ConventionProfileCache:
                 partial_sha256=digest,
             ),
             profile=profile.model_copy(update={"cache": None}),
+            observed=_PersistentStyleObservation(
+                complete=styles_complete,
+                styles=styles,
+            ),
         )
         lock = PreviewFileLock.try_acquire(self.lock_path(document))
         if lock is None:

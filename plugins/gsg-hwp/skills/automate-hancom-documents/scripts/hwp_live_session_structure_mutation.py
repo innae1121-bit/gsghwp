@@ -425,6 +425,7 @@ def apply_validated_layout(
             candidate.document_id,
             candidate.full_name,
         ),
+        candidate=candidate,
     )
     if resolved_plan.target == "current":
         validate_layout_anchor(hwp, resolved_plan, guard)

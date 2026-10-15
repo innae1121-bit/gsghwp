@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Final
 
-from hwp_live_structure_contract import StructureTable
+from hwp_live_structure_contract import StructureCell, StructureTable
 from hwp_live_native_template_repeat import caption_literal_text
 from hwp_live_template_repeat import (
     TableTemplateRepeatPlan,
@@ -29,8 +30,49 @@ from hwp_visibility_table_cells import (
     compact_cell_text,
     logical_cells,
     owner_cells,
-    required_cell,
 )
+
+
+_SLOT_REMAINDER_SHAPES: Final[tuple[tuple[int, int, int], ...]] = (
+    (0, 2, 2),
+    (0, 4, 1),
+    (0, 5, 1),
+    (1, 0, 1),
+    (1, 1, 1),
+    (1, 2, 2),
+    (1, 4, 1),
+    (1, 5, 1),
+    (2, 0, 3),
+    (2, 3, 3),
+    (3, 0, 3),
+    (3, 3, 3),
+    (4, 0, 2),
+    (4, 2, 4),
+)
+
+
+def _has_cell_shape(
+    cells: tuple[StructureCell, ...], row: int, column: int, column_span: int
+) -> bool:
+    return any(
+        cell.row == row and cell.column == column and cell.column_span == column_span
+        for cell in cells
+    )
+
+
+def _slot_header_candidates(
+    table: StructureTable, owners: tuple[StructureCell, ...]
+) -> tuple[StructureCell, ...]:
+    return tuple(
+        cell
+        for cell in owners
+        if cell.column == 0
+        and cell.row + 4 < table.rows
+        and all(
+            _has_cell_shape(owners, cell.row + row, column, column_span)
+            for row, column, column_span in _SLOT_REMAINDER_SHAPES
+        )
+    )
 
 
 def _caption_title(table: StructureTable) -> str | None:
@@ -45,6 +87,8 @@ def _caption_title(table: StructureTable) -> str | None:
 
 def analyze_visibility_template(table: StructureTable) -> VisibilityTemplateObservation:
     owners = owner_cells(table)
+    candidates = _slot_header_candidates(table, owners)
+    headers = tuple(cell for cell in candidates if cell.column_span == 2)
     owner_addresses = frozenset(cell.address for cell in owners)
     missing_owner_addresses = tuple(
         sorted(
@@ -58,8 +102,8 @@ def analyze_visibility_template(table: StructureTable) -> VisibilityTemplateObse
     cells: list[VisibilityTemplateCellObservation] = []
     for cell in owners:
         compact = compact_cell_text(cell.text)
-        text_matches = compact == "구분"
-        span_ok = cell.column_span >= 2
+        is_candidate = cell in candidates
+        span_ok = cell.column_span == 2
         cells.append(
             VisibilityTemplateCellObservation(
                 address=cell.address,
@@ -71,30 +115,20 @@ def analyze_visibility_template(table: StructureTable) -> VisibilityTemplateObse
                 raw_text=cell.text,
                 compact_text=compact,
                 is_owner=True,
-                text_matches=text_matches,
+                text_matches=is_candidate,
                 span_ok=span_ok,
-                is_candidate=text_matches or span_ok,
-                is_header=text_matches and span_ok,
+                is_candidate=is_candidate,
+                is_header=cell in headers,
             )
         )
-    headers = tuple(
-        cell
-        for cell in owners
-        if compact_cell_text(cell.text) == "구분" and cell.column_span >= 2
-    )
     ordered = tuple(sorted(headers, key=lambda cell: cell.row))
     gaps = tuple(right.row - left.row for left, right in zip(ordered, ordered[1:]))
     slot_height = (
         None if not ordered else table.rows - ordered[0].row if not gaps else gaps[0]
     )
     condition_owner_cells_complete = not missing_owner_addresses
-    condition_header_text_found = any(
-        compact_cell_text(cell.text) == "구분" for cell in owners
-    )
-    condition_header_span_found = any(
-        compact_cell_text(cell.text) == "구분" and cell.column_span >= 2
-        for cell in owners
-    )
+    condition_header_text_found = bool(candidates)
+    condition_header_span_found = bool(headers)
     condition_slot_height_minimum = slot_height is not None and slot_height >= 5
     condition_slot_gaps_uniform = bool(ordered) and all(
         gap == slot_height for gap in gaps
@@ -111,13 +145,14 @@ def analyze_visibility_template(table: StructureTable) -> VisibilityTemplateObse
         )
     if not condition_header_text_found:
         observed = ", ".join(
-            f"{cell.address}:{compact_cell_text(cell.text)}" for cell in owners
+            f"{cell.address}:r{cell.row}c{cell.column}s{cell.column_span}"
+            for cell in owners
         )
         mismatches.append(
             VisibilityTemplateMismatch(
                 code="header_text_mismatch",
-                reason="반복 머리글 텍스트가 정확히 구분이어야 합니다",
-                expected="compact_text == 구분",
+                reason="반복 슬롯의 병합 셀 토폴로지를 찾지 못했습니다",
+                expected="five-row slot topology",
                 observed=observed,
             )
         )
@@ -125,13 +160,13 @@ def analyze_visibility_template(table: StructureTable) -> VisibilityTemplateObse
         observed = ", ".join(
             f"{cell.address}:column_span={cell.column_span}"
             for cell in owners
-            if compact_cell_text(cell.text) == "구분"
+            if cell in candidates
         )
         mismatches.append(
             VisibilityTemplateMismatch(
                 code="header_span_too_small",
-                reason="구분 머리글 셀은 최소 2열 이상 병합되어야 합니다",
-                expected="column_span >= 2",
+                reason="반복 슬롯 시작 셀의 열 병합 범위가 맞지 않습니다",
+                expected="column_span == 2",
                 observed=observed,
             )
         )
@@ -195,27 +230,26 @@ def visibility_template_slots(
     observation = analyze_visibility_template(table)
     if not observation.header_positions:
         raise VisibilitySeriesPlanError(
-            "템플릿에서 반복 구분 머리글을 찾지 못했습니다", observation
+            "템플릿에서 반복 슬롯 시작 셀을 찾지 못했습니다", observation
         )
     if not observation.recognized:
         raise VisibilitySeriesPlanError(
             "템플릿의 반복 슬롯 구조가 표준 조건과 일치하지 않습니다", observation
         )
     owners = owner_cells(table)
+    header_positions = frozenset(
+        (position.row, position.column) for position in observation.header_positions
+    )
     ordered = tuple(
         sorted(
-            (
-                cell
-                for cell in owners
-                if compact_cell_text(cell.text) == "구분" and cell.column_span >= 2
-            ),
+            (cell for cell in owners if (cell.row, cell.column) in header_positions),
             key=lambda cell: cell.row,
         )
     )
     slot_height = observation.slot_height
     if slot_height is None:
         raise VisibilitySeriesPlanError(
-            "템플릿에서 반복 구분 머리글을 찾지 못했습니다", observation
+            "템플릿에서 반복 슬롯 시작 셀을 찾지 못했습니다", observation
         )
     try:
         logical = logical_cells(table)
@@ -225,73 +259,56 @@ def visibility_template_slots(
     for header in ordered:
         row = header.row
         try:
-            location_header = required_cell(
-                owners,
-                "조망위치 머리글",
-                lambda cell: (
-                    cell.row == row and compact_cell_text(cell.text) == "조망위치"
-                ),
+            location_header = cell_at(
+                logical, row, header.column + header.column_span, "두 번째 머리글"
             )
-            distance_header = required_cell(
-                owners,
-                "이격거리 머리글",
-                lambda cell: (
-                    cell.row == row and compact_cell_text(cell.text) == "이격거리"
-                ),
+            distance_header = cell_at(
+                logical,
+                row,
+                location_header.column + location_header.column_span,
+                "세 번째 머리글",
             )
-            elevation_header = required_cell(
-                owners,
-                "표고 머리글",
-                lambda cell: (
-                    cell.row == row and compact_cell_text(cell.text).startswith("표고")
-                ),
+            elevation_header = cell_at(
+                logical,
+                row,
+                distance_header.column + distance_header.column_span,
+                "네 번째 머리글",
             )
-            visibility_label = required_cell(
-                owners,
-                "가시권 분석 라벨",
-                lambda cell: (
-                    cell.row == row + 2 and compact_cell_text(cell.text) == "가시권분석"
-                ),
+            visibility_label = cell_at(logical, row + 2, header.column, "왼쪽 사진")
+            current_label = cell_at(
+                logical,
+                row + 2,
+                visibility_label.column + visibility_label.column_span,
+                "오른쪽 사진",
             )
-            current_label = required_cell(
-                owners,
-                "현황사진 라벨",
-                lambda cell: (
-                    cell.row == row + 2 and compact_cell_text(cell.text) == "현황사진"
-                ),
-            )
-            result_label = required_cell(
-                owners,
-                "분석결과 라벨",
-                lambda cell: (
-                    cell.row == row + 4 and compact_cell_text(cell.text) == "분석결과"
-                ),
-            )
+            result_label = cell_at(logical, row + 4, header.column, "결과")
         except VisibilitySeriesPlanError as error:
             raise VisibilitySeriesPlanError(error.message, observation) from error
         slots.append(
             VisibilitySlot(
                 header=header,
-                category=cell_at(logical, row + 1, header.column, "구분 값"),
-                label=cell_at(logical, row + 1, header.column + 1, "조망점 번호"),
+                category=cell_at(logical, row + 1, header.column, "첫 번째 값"),
+                label=cell_at(logical, row + 1, header.column + 1, "두 번째 값"),
                 location=cell_at(
-                    logical, row + 1, location_header.column, "조망위치 값"
+                    logical, row + 1, location_header.column, "세 번째 값"
                 ),
                 distance=cell_at(
-                    logical, row + 1, distance_header.column, "이격거리 값"
+                    logical, row + 1, distance_header.column, "네 번째 값"
                 ),
-                elevation=cell_at(logical, row + 1, elevation_header.column, "표고 값"),
+                elevation=cell_at(
+                    logical, row + 1, elevation_header.column, "다섯 번째 값"
+                ),
                 visibility_image=cell_at(
-                    logical, row + 3, visibility_label.column, "가시권 사진"
+                    logical, row + 3, visibility_label.column, "왼쪽 사진 값"
                 ),
                 current_image=cell_at(
-                    logical, row + 3, current_label.column, "현황사진"
+                    logical, row + 3, current_label.column, "오른쪽 사진 값"
                 ),
                 result=cell_at(
                     logical,
                     row + 4,
                     result_label.column + result_label.column_span,
-                    "분석결과 값",
+                    "결과 값",
                 ),
             )
         )

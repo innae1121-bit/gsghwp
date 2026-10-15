@@ -37,6 +37,8 @@ class ParagraphFormatting:
     # own automatic number on a paragraph instead of leaving it bare.
     heading_type: int | None = None
     heading_level: int | None = None
+    keep_with_next: bool | None = None
+    page_break_before: bool | None = None
 
 
 def lead_before_mm(
@@ -106,8 +108,23 @@ def style_command(style_id: int) -> ParameterActionCommand:
 
 def character_command(
     formatting: CharacterFormatting,
+    *,
+    letter_spacing_percent: int | None = None,
 ) -> ParameterActionCommand | None:
     setters: list[NativeSetter] = []
+    if letter_spacing_percent is not None:
+        for language in (
+            "Hangul",
+            "Latin",
+            "Hanja",
+            "Japanese",
+            "Other",
+            "Symbol",
+            "User",
+        ):
+            setters.append(
+                NativeSetter(f"Spacing{language}", IntegerValue(letter_spacing_percent))
+            )
     if formatting.bold is not None:
         setters.append(NativeSetter("Bold", BooleanValue(formatting.bold)))
     if formatting.font_size_pt is not None:
@@ -194,6 +211,12 @@ def paragraph_command(
     ):
         if level is not None:
             setters.append(NativeSetter(name, IntegerValue(level)))
+    for name, value in (
+        ("KeepWithNext", formatting.keep_with_next),
+        ("PagebreakBefore", formatting.page_break_before),
+    ):
+        if value is not None:
+            setters.append(NativeSetter(name, BooleanValue(value)))
     if not setters:
         return None
     return ParameterActionCommand(

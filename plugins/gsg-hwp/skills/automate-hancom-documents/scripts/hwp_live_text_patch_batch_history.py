@@ -25,7 +25,7 @@ from hwp_live_edit_history_runtime import (
     _record_completed_edit,
     _remove_path,
     _restore_prepared_before_failure,
-    document_checkpoint_unavailable_reason,
+    full_document_checkpoint_unavailable_reason as document_checkpoint_unavailable_reason,
 )
 from hwp_live_native_action_contract import (
     NativeActionFailure,
@@ -47,6 +47,7 @@ from hwp_live_native_batch import (
     execute_native_actions,
     preflight_native_text_patches,
     read_native_content_signature,
+    remembered_content_signature_refusal,
 )
 from hwp_live_native_text_format import ParagraphFormatting, paragraph_command
 from hwp_live_rot import HwpDocumentCandidate
@@ -72,10 +73,12 @@ from hwp_live_text_patch_contract import (
 
 
 def _replacement_end(start: NativePosition, text: str) -> NativePosition:
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     return NativePosition(
         start.list_id,
-        start.paragraph,
-        start.character + len(text.encode("utf-16-le")) // 2,
+        start.paragraph + len(lines) - 1,
+        (start.character if len(lines) == 1 else 0)
+        + len(lines[-1].encode("utf-16-le")) // 2,
     )
 
 
@@ -313,7 +316,8 @@ def _rollback_prepared_text_patch_batch(
         )
     except Exception as rollback_error:  # noqa: BLE001 - restoration is uncertain
         raise HwpLiveError(
-            "prepared text.patch inverse rollback 실행 또는 검증에 실패했습니다",
+            "prepared text.patch inverse rollback 실행 또는 검증에 실패했습니다"
+            + f"; 원인: {error}; rollback: {rollback_error}",
             mutation_started=True,
             safe_to_repeat=False,
         ) from rollback_error
@@ -333,7 +337,8 @@ def _rollback_prepared_text_patch_batch(
             + f"; 역패치 실행={'보고됨' if restored is not None else '보고 없음'}"
             + f"; 대상 원문·서식 복원={'확인' if exact_targets_restored else '미확인'}"
             + "; 문서 지문 대조="
-            + _signature_verdict(before_signature, restored_signature),
+            + _signature_verdict(before_signature, restored_signature)
+            + f"; 최초 실패: {error}",
             mutation_started=True,
             safe_to_repeat=False,
         ) from error
@@ -350,6 +355,143 @@ def _signature_verdict(before_signature: str, restored_signature: str) -> str:
     )
 
 
+def _text_length_stable_characters() -> frozenset[str]:
+    """The characters a `TEXT` export writes one code unit per UTF-16 unit.
+
+    `REV`'s text length is the length of ``GetTextFile("TEXT")`` in UTF-16
+    units, and that export is an EUC-KR round trip: what survives it unchanged
+    in length is exactly what EUC-KR can encode in one or two bytes as a single
+    character. M1 measured the round trip character by character (20/20 plus
+    the follow-up sweep) and only two families came back 1:1 -- printable ASCII
+    0x20..0x7E, and the 2,350 KS X 1001 한글 음절, which are the syllables whose
+    EUC-KR encoding is two bytes. Everything else grows: the 8,822 extended
+    syllables (`힣`, `똠`, `갂`), emoji, combining sequences.
+
+    Control characters are outside the set by construction -- the ASCII half
+    starts at 0x20 -- and that is where the newline rule lands too. A newline
+    leaves the export as CR LF, two units for the one unit it occupies in the
+    request, so an expected_text carrying one would break the equality this set
+    exists to guarantee. It cannot: CR and LF are not in here.
+
+    Built once, at import. Measured at 2.5ms for the whole 11,172-syllable
+    sweep, which is why it is a frozenset and not a per-call test.
+    """
+    stable = {chr(code) for code in range(0x20, 0x7F)}
+    for code in range(0xAC00, 0xD7A4):
+        character = chr(code)
+        try:
+            encoded = character.encode("euc_kr")
+        except UnicodeEncodeError:
+            continue
+        if len(encoded) == 2:
+            stable.add(character)
+    return frozenset(stable)
+
+
+_TEXT_LENGTH_STABLE_CHARACTERS: Final = _text_length_stable_characters()
+
+
+def _utf16_units(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def prepared_patch_keeps_refusal(
+    requests: tuple[TextPatchRequest, ...],
+    before_page_count: int,
+    after_page_count: int,
+) -> bool:
+    """Whether this batch cannot have made a refusing document signable.
+
+    Pure arithmetic over the request list; it reads nothing and calls nothing.
+    True is the narrow claim that ``_engine_still_refuses``
+    (hwp_live_native_batch.py :761) would answer True after this edit, so the
+    revision-token read that produces that answer -- about 6s on a 317MB
+    document -- may be skipped. False is "not proven", never "the refusal
+    lapsed"; the caller then reads exactly as it did before.
+
+    That function keeps a refusal when the session tag matches and none of page
+    count, control count and text length dropped. The session tag cannot move
+    inside one call. The other three are answered here, one condition each:
+
+    * text length is ``GetTextFile("TEXT")`` in UTF-16 units, so the change is
+      Σ(S(replacement) − S(expected_text)) with S the EUC-KR export length. For
+      an expected_text drawn entirely from ``_text_length_stable_characters``
+      S(expected) is its UTF-16 length exactly, and no string exports shorter
+      than its UTF-16 length, so S(replacement) ≥ len16(replacement). A
+      non-negative Σ(len16(replacement) − len16(expected_text)) therefore bounds
+      the real delta from below at zero. The expected side must be restricted
+      and the replacement side need not be, because the inequality runs the
+      safe way only in that direction.
+    * control count cannot drop, because every target is a ``find``. M1 proved
+      a find target cannot delete a control (4 kinds, 4/4): the anchor's eight
+      cells break the text run, so a match crossing one fails as
+      ``TEXT_OCCURRENCE_NOT_FOUND``. A ``range`` target can delete one -- a
+      snapped endpoint takes the anchor with it -- which is why range, current
+      and the cell kinds are refused here rather than reasoned about.
+    * page count is observed rather than derived: ``TextPatchResult``'s before
+      and after snapshots carry the same number `REV` reports (3/3), so the
+      caller hands both in.
+
+    Nothing is remembered or invalidated by answering this. A True that was
+    somehow wrong would cost one missing MCP undo entry -- the same price the
+    refusal path already announces -- and self-heals on the next read.
+    """
+    if not requests:
+        return False
+    if after_page_count < before_page_count:
+        return False
+    text_length_delta = 0
+    for request in requests:
+        if request.target.kind != "find":
+            return False
+        expected = request.expected_text
+        if expected is None:
+            return False
+        if not all(
+            character in _TEXT_LENGTH_STABLE_CHARACTERS for character in expected
+        ):
+            return False
+        text_length_delta += _utf16_units(request.replacement) - _utf16_units(expected)
+    return text_length_delta >= 0
+
+
+def _after_signature_repeats_the_refusal(
+    candidate: HwpDocumentCandidate,
+    requests: tuple[TextPatchRequest, ...],
+    result: TextPatchResult,
+    before_signature: str,
+) -> bool:
+    """Whether reading the post-edit signature can only re-derive the empty one.
+
+    Three facts, all cheap. The pre-edit read already came back empty, so this
+    document was refused before the edit. A refusal is remembered for this
+    window, so the post-edit read would go to ``_engine_still_refuses`` rather
+    than to the engine (``read_native_content_signature``,
+    hwp_live_native_batch.py :2939, consults the cache and then that memory
+    before ever calling ``ContentSignature``). And the batch cannot have
+    lowered any measure that function compares. Then the read's whole product
+    is the empty string this returns instead.
+
+    ``remembered_content_signature_refusal`` is the I/O-free half of that
+    memory on purpose: ``engine_refuses_content_signature`` would answer the
+    same question by reading the revision token on a miss, which is the ~6s
+    call being avoided.
+
+    Skipping touches nothing. It does not fill the signature cache the way the
+    real read does, and M2 measured that fill to be inert anyway -- the global
+    clear in ``_call_mutation``'s finally empties it 99-166µs later, before any
+    reader gets to it. The refusal memory is untouched on both paths: today's
+    True branch of ``_engine_still_refuses`` leaves it exactly as it found it.
+    """
+    if before_signature:
+        return False
+    if remembered_content_signature_refusal(candidate.window_handle) is None:
+        return False
+    return prepared_patch_keeps_refusal(
+        requests, result.before.page_count, result.after.page_count
+    )
+
+
 def record_prepared_text_patch_history(
     candidate: HwpDocumentCandidate,
     history: LiveEditHistoryStore,
@@ -357,8 +499,15 @@ def record_prepared_text_patch_history(
     forward: tuple[NativeActionCommand, ...],
     inverse_by_forward: tuple[tuple[NativeActionCommand, ...], ...],
     before_signature: str,
+    requests: tuple[TextPatchRequest, ...],
 ) -> None:
-    after_signature = read_native_content_signature(candidate.window_handle) or ""
+    after_signature = (
+        ""
+        if _after_signature_repeats_the_refusal(
+            candidate, requests, result, before_signature
+        )
+        else read_native_content_signature(candidate.window_handle) or ""
+    )
     inverse = _completed_prepared_inverse(inverse_by_forward, len(inverse_by_forward))
     history.record(
         LogicalTextPatchBatchHistoryEntry(
@@ -386,7 +535,46 @@ def _execute_prepared_text_patch_batch(
     guard: Callable[[], None],
     receipt: TextPatchPreparedReceipt,
 ) -> TextPatchResult:
+    # 편집 전 지문 읽기는 이 경로가 가진 before-image 확보 그 자체다 — 체크포인트
+    # 경로가 `checkpoint_before` 로 재는 그 자리이고, 되돌린 뒤의 대조도 체크포인트와
+    # 같은 규약(checkpoint_signatures_match)을 쓴다. 실사용 저널에서 이 호출은 편집당
+    # 수 초를 쓰면서도 어느 phase 에도 귀속되지 않아 응답에서 보이지 않았다.
+    signature_before_started = perf_counter_ns()
     before_signature = read_native_content_signature(candidate.window_handle) or ""
+    signature_before_elapsed = (perf_counter_ns() - signature_before_started) // 1_000
+    try:
+        return _patch_prepared_text_batch(
+            hwp,
+            candidate,
+            history,
+            requests,
+            unsafe_selectors,
+            guard,
+            receipt,
+            before_signature,
+            signature_before_elapsed,
+        )
+    except HwpLiveError as error:
+        # 실패도 그 시간을 들고 나간다. 실패 응답에서 빠지면 실패한 편집이 쓴 시간은
+        # 다시 보이지 않는다 — `_unrecorded_failure` 가 지키는 규약과 같다.
+        error.phase_timings = (
+            *error.phase_timings,
+            ("checkpoint_before", "python", signature_before_elapsed),
+        )
+        raise
+
+
+def _patch_prepared_text_batch(
+    hwp: LiveHwpApplication,
+    candidate: HwpDocumentCandidate,
+    history: LiveEditHistoryStore,
+    requests: tuple[TextPatchRequest, ...],
+    unsafe_selectors: set[str],
+    guard: Callable[[], None],
+    receipt: TextPatchPreparedReceipt,
+    before_signature: str,
+    signature_before_elapsed: int,
+) -> TextPatchResult:
     forward, inverse_by_forward = _prepared_command_inverses(requests, receipt)
     try:
         result = patch_validated_text_batch(
@@ -405,9 +593,19 @@ def _execute_prepared_text_patch_batch(
             if restored:
                 raise _restored_prepared_failure(error) from error
         raise
+    # 편집 뒤 지문 읽기는 이 이력 기록 안에 있다. 체크포인트 경로가 같은 이름으로
+    # `_record_completed_edit` 한 덩어리를 재듯이, 여기서도 이력 기록 한 덩어리를
+    # 잰다 — 그 안에서 시간을 쓰는 것은 사실상 지문 읽기 하나다.
+    history_started = perf_counter_ns()
     try:
         record_prepared_text_patch_history(
-            candidate, history, result, forward, inverse_by_forward, before_signature
+            candidate,
+            history,
+            result,
+            forward,
+            inverse_by_forward,
+            before_signature,
+            requests,
         )
     except Exception as error:  # noqa: BLE001 - history is transactional here
         # 여기 오는 실패는 편집이 *끝난 뒤* 이력 기록에서 난 것이다. 전량 실행은
@@ -425,7 +623,22 @@ def _execute_prepared_text_patch_batch(
         if restored:
             raise _restored_prepared_failure(error) from error
         raise
-    return result
+    history_elapsed = (perf_counter_ns() - history_started) // 1_000
+    # 새 항목은 일어난 순서대로 앞뒤에 끼운다 — before-image 확보는 편집보다 앞이고
+    # 이력 기록은 판독보다 뒤다. 체크포인트 경로가 같은 이름들로 내는 순서
+    # (validation, planning_preflight, checkpoint_before, mutation,
+    # checkpoint_after_history, total)와 읽는 방향이 같아야 워터폴이 거짓말을 하지
+    # 않는다. 이미 나가고 있던 항목들끼리의 상대순서와 이름·값은 그대로다.
+    return replace(
+        result,
+        phase_timings=(
+            TextPatchPhaseTiming(
+                "checkpoint_before", "python", signature_before_elapsed
+            ),
+            *result.phase_timings,
+            TextPatchPhaseTiming("checkpoint_after_history", "python", history_elapsed),
+        ),
+    )
 
 
 # The checkpointed path answers a mid-run failure with "the copy was restored"
@@ -534,7 +747,9 @@ def execute_managed_text_patch_batch(
                 allow_exact_omission=allow_exact_omission,
                 require_current_expected=True,
             )
-        _ = compile_text_patch_batch(requests)
+        # Validate the preparation payload. Inspected literal offsets become
+        # executable native coordinates only after the read-only preflight.
+        _ = compile_text_patch_batch(requests, preflight=True)
     except HwpLiveError as error:
         validation_elapsed = (perf_counter_ns() - validation_started) // 1_000
         error.phase_timings = (

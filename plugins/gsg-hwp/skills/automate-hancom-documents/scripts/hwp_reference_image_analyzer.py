@@ -10,6 +10,7 @@ from pathlib import Path
 from PIL import Image, UnidentifiedImageError
 
 from hwp_reference_image_artifacts import (
+    ARTIFACT_IMAGE_SUFFIX,
     save_contact_sheets,
     save_overlay,
     save_tiles,
@@ -270,7 +271,7 @@ def _stopped_analysis(
         breakpoint_candidates=(),
         tiles=(),
         contact_sheet_paths=(),
-        overlay_path=directory / "evidence-overlay.png",
+        overlay_path=directory / f"evidence-overlay{ARTIFACT_IMAGE_SUFFIX}",
     )
 
 
@@ -374,7 +375,7 @@ def _analyze_into_directory(
             temporary_tiles,
             directory=temporary,
         )
-        temporary_overlay = temporary / "evidence-overlay.png"
+        temporary_overlay = temporary / f"evidence-overlay{ARTIFACT_IMAGE_SUFFIX}"
         save_overlay(
             canvas,
             objects=pixel_objects,

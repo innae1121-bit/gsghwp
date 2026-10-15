@@ -987,6 +987,7 @@ public:
         FindDirection = 95,
         FindMatchCase = 96,
         FindIgnoreMessage = 97,
+        MovePos = 98,
     };
 
     bool CompletedLifecycleSequence() const noexcept {
@@ -1881,6 +1882,9 @@ public:
 
     void RestoreReferenceLayoutFixture() noexcept {
         referenceLayoutFixture_ = false;
+        twoReferenceTables_ = false;
+        selectedReferenceTableId_ = L"reference-table";
+        otherReferenceCells_.clear();
         emptyCellTextFixture_ = false;
         emptyCellSelectAll_ = false;
         preflightSelectionFixture_ = false;
@@ -2059,6 +2063,82 @@ public:
             referenceTopologyInspections_ == 2;
     }
 
+    void PreparePublicCellTopologyFixture() {
+        PrepareTopologyReuseFixture();
+        wrongReferenceControlIdentity_ = false;
+        for (ReferenceCell& cell : referenceCells_) {
+            cell.text = L"old";
+        }
+    }
+
+    void PrepareEmptyPublicCellTopologyFixture() {
+        PreparePublicCellTopologyFixture();
+        for (ReferenceCell& cell : referenceCells_) cell.text.clear();
+    }
+
+    void SetWrongReferenceControlIdentity(const bool enabled) noexcept {
+        wrongReferenceControlIdentity_ = enabled;
+    }
+
+    void PreparePublicTwoTableTopologyFixture() {
+        PreparePublicCellTopologyFixture();
+        twoReferenceTables_ = true;
+        selectedReferenceTableId_ = L"reference-table";
+        otherReferenceCells_ = referenceCells_;
+        for (ReferenceCell& cell : referenceCells_) {
+            cell.text = L"old-a";
+        }
+        for (ReferenceCell& cell : otherReferenceCells_) {
+            cell.listId += 1000;
+            cell.text = L"old-b";
+        }
+    }
+
+    bool PublicTwoTableStateMatches(const bool edited) const noexcept {
+        if (!twoReferenceTables_ || selectedReferenceTableId_ != L"reference-table" ||
+            referenceTextInsertions_ != (edited ? 3U : 0U)) {
+            return false;
+        }
+        for (size_t index = 0; index < referenceCells_.size(); ++index) {
+            ReferenceFormat firstFormat = BodyReferenceFormat();
+            ReferenceFormat secondFormat = BodyReferenceFormat();
+            if (edited && index < 2) firstFormat.textColor = 8388736;
+            if (edited && index == 0) secondFormat.textColor = 8388736;
+            if (referenceCells_[index].text != (edited && index < 2 ? L"new" : L"old-a") ||
+                otherReferenceCells_[index].text != (edited && index == 0 ? L"new" : L"old-b") ||
+                !ReferenceFormatMatches(referenceCells_[index].format, firstFormat) ||
+                !ReferenceFormatMatches(otherReferenceCells_[index].format, secondFormat)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    size_t PublicCellTopologyInspections() const noexcept {
+        return referenceTopologyInspections_;
+    }
+
+    bool PublicCellPatchStateMatches(
+        const size_t changedCells,
+        const bool purple,
+        const bool initiallyEmpty = false) const noexcept {
+        if (referenceTextInsertions_ != changedCells) {
+            return false;
+        }
+        for (size_t index = 0; index < referenceCells_.size(); ++index) {
+            const ReferenceCell& cell = referenceCells_[index];
+            ReferenceFormat expected = BodyReferenceFormat();
+            if (index < changedCells && purple) {
+                expected.textColor = 8388736;
+            }
+            if (cell.text != (index < changedCells ? L"new" : initiallyEmpty ? L"" : L"old") ||
+                !ReferenceFormatMatches(cell.format, expected)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     void PrepareFormattingTopologyPolicyFixture() {
         PrepareReferenceLayoutFixture(false);
         referenceTableExists_ = true;
@@ -2131,6 +2211,13 @@ public:
         findSelectionSurplus_ = surplus;
         findDisplayOnlyPrefix_ = displayOnlyPrefix;
         findString_.clear();
+        textScanChunks_.clear();
+        failTextScanRelease_ = false;
+        findActionAttempts_ = 0;
+        textScanHiddenPrefix_ = 0;
+        textScanHiddenAt_ = 0;
+        textScanReadbacks_ = 0;
+        scanStep_ = 0;
         ReferenceCell* const cell = ReferenceCellByAddress(L"B2");
         if (cell != nullptr) {
             cell->text = L"the old";
@@ -2143,6 +2230,39 @@ public:
         const ReferenceCell* const cell = ReferenceCellByAddress(L"B2");
         return cell == nullptr ? std::wstring() : cell->text;
     }
+
+    struct TextScanChunk {
+        LONG state;
+        LONG list;
+        LONG paragraph;
+        LONG character;
+        std::wstring text;
+    };
+
+    void PrepareTextScanFixture(
+        const std::wstring& text,
+        std::vector<TextScanChunk> chunks,
+        const bool failRelease = false,
+        const LONG hiddenPrefix = 0,
+        const LONG hiddenAt = 0) {
+        PrepareFindSelectionSurplusFixture(0, false);
+        ReferenceCell* const cell = ReferenceCellByAddress(L"B2");
+        if (cell != nullptr) {
+            cell->text = text;
+        }
+        textScanChunks_ = std::move(chunks);
+        failTextScanRelease_ = failRelease;
+        textScanHiddenPrefix_ = hiddenPrefix;
+        textScanHiddenAt_ = hiddenAt;
+    }
+
+    bool TextScanWasPopupFree() const noexcept {
+        return findActionAttempts_ == 0 && scanReleased_;
+    }
+
+    LONG TextScanSteps() const noexcept { return scanStep_; }
+    size_t TextScanReadbacks() const noexcept { return textScanReadbacks_; }
+    bool TextScanDidNotSearch() const noexcept { return scanStep_ == 0 && findActionAttempts_ == 0; }
 
     bool AutomaticNumberSelectTextFallbackUsed() const noexcept {
         return automaticNumberSelectTextRefusals_ > 0 &&
@@ -2641,6 +2761,8 @@ public:
             members[0] = SetTextFile;
         } else if (name == L"InitScan") {
             members[0] = InitScan;
+        } else if (name == L"MovePos") {
+            members[0] = MovePos;
         } else if (name == L"GetText") {
             members[0] = GetText;
         } else if (name == L"ReleaseScan") {
@@ -3513,9 +3635,9 @@ public:
                         parameters->rgvarg[1].vt != VT_BSTR) {
                         return DISP_E_TYPEMISMATCH;
                     }
+                    const std::wstring requestedTable(parameters->rgvarg[1].bstrVal);
                     tableSelected_ = referenceTableExists_ &&
-                        std::wstring(parameters->rgvarg[1].bstrVal) ==
-                            L"reference-table";
+                        SelectReferenceTable(requestedTable);
                     if (preflightSelectionFixture_ && tableSelected_) {
                         if (preflightTableControlSelection_ &&
                             preflightSelectionControlCaptured_ &&
@@ -3725,6 +3847,11 @@ public:
                     parameters->rgvarg[1].vt == VT_I4 &&
                     parameters->rgvarg[2].vt == VT_I4) {
                     const LONG list = parameters->rgvarg[2].lVal;
+                    if (twoReferenceTables_ && list >= 648 && list <= 653) {
+                        static_cast<void>(SelectReferenceTable(L"reference-table"));
+                    } else if (twoReferenceTables_ && list >= 1648 && list <= 1653) {
+                        static_cast<void>(SelectReferenceTable(L"reference-table-b"));
+                    }
                     if (referenceTopologyChanged_ && list == 649 &&
                         referenceTopologyInspections_ < 2) {
                         staleTopologyCellPositionAttempted_ = true;
@@ -3877,6 +4004,24 @@ public:
                 result->boolVal = nativeTableRangeSelected_ ? VARIANT_TRUE : VARIANT_FALSE;
                 return S_OK;
             }
+            if (member == MovePos) {
+                if (parameters == nullptr || parameters->cArgs != 3 ||
+                    parameters->rgvarg[2].lVal != 201 ||
+                    !scanStarted_ || scanReleased_) {
+                    return E_INVALIDARG;
+                }
+                if (!textScanChunks_.empty() && scanStep_ > 0 &&
+                    static_cast<size_t>(scanStep_) <= textScanChunks_.size()) {
+                    const auto& chunk = textScanChunks_[static_cast<size_t>(scanStep_ - 1)];
+                    currentList_ = chunk.list;
+                    currentParagraph_ = chunk.paragraph;
+                    currentCharacter_ = chunk.character;
+                }
+                selectionMode_ = 0;
+                result->vt = VT_BOOL;
+                result->boolVal = VARIANT_TRUE;
+                return S_OK;
+            }
             if (member == InitScan) {
                 if (parameters == nullptr || parameters->cArgs != 6) {
                     return DISP_E_BADPARAMCOUNT;
@@ -3884,6 +4029,8 @@ public:
                 scanStarted_ = true;
                 scanReleased_ = false;
                 scanStep_ = 0;
+                textLookupScan_ = parameters->rgvarg[4].lVal == 0x77 ||
+                    parameters->rgvarg[4].lVal == 0x55;
                 checkpointPresenceScan_ =
                     checkpointDocumentFileFixture_ && checkpointTextFileEmpty_;
                 if (preflightSelectionFixture_ &&
@@ -3900,6 +4047,15 @@ public:
                     parameters->rgvarg[0].vt != (VT_BSTR | VT_BYREF) ||
                     parameters->rgvarg[0].pbstrVal == nullptr) {
                     return DISP_E_TYPEMISMATCH;
+                }
+                if (textLookupScan_ && !textScanChunks_.empty()) {
+                    const size_t index = static_cast<size_t>(scanStep_++);
+                    const bool hasChunk = index < textScanChunks_.size();
+                    *parameters->rgvarg[0].pbstrVal = SysAllocString(
+                        hasChunk ? textScanChunks_[index].text.c_str() : L"");
+                    result->vt = VT_I4;
+                    result->lVal = hasChunk ? textScanChunks_[index].state : 1;
+                    return S_OK;
                 }
                 const bool content = scanStep_++ == 0;
                 const ReferenceCell* const cell = referenceLayoutFixture_
@@ -3926,6 +4082,9 @@ public:
                     return E_UNEXPECTED;
                 }
                 scanReleased_ = true;
+                if (textLookupScan_ && failTextScanRelease_) {
+                    return E_FAIL;
+                }
                 return S_OK;
             }
             if (member == GetTextFile) {
@@ -3975,6 +4134,7 @@ public:
                             selectedStartList_);
                         if (cell != nullptr &&
                             selectedStartList_ == selectedEndList_) {
+                            ++textScanReadbacks_;
                             const size_t first = ReferenceTextOffset(
                                 cell->text,
                                 selectedStartParagraph_,
@@ -4681,6 +4841,7 @@ public:
                     } else if (currentAction_ == L"CellBorderFill") {
                         ClearReferenceBorders();
                     } else if (currentAction_ == L"ForwardFind") {
+                        ++findActionAttempts_;
                         const ReferenceCell* const cell =
                             ReferenceCellByList(currentList_);
                         result->vt = VT_BOOL;
@@ -4792,7 +4953,8 @@ public:
                 } else {
                     result->bstrVal = SysAllocString(
                         referenceLayoutFixture_
-                            ? L"reference-table"
+                            ? (wrongReferenceControlIdentity_
+                                ? L"unexpected-table" : selectedReferenceTableId_.c_str())
                             : L"captured-table");
                 }
                 return result->bstrVal != nullptr ? S_OK : E_OUTOFMEMORY;
@@ -4903,10 +5065,10 @@ private:
         std::map<std::wstring, ReferenceBorder> borders;
     };
 
-    static size_t ReferenceTextOffset(
+    size_t ReferenceTextOffset(
         const std::wstring& text,
         const LONG paragraph,
-        const LONG character) noexcept {
+        const LONG character) const noexcept {
         const LONG requestedParagraph = (std::max)(0L, paragraph);
         size_t lineStart = 0;
         LONG currentParagraph = 0;
@@ -4928,8 +5090,9 @@ private:
         const size_t lineEnd = text.find_first_of(L"\r\n", lineStart);
         const size_t boundedEnd =
             lineEnd == std::wstring::npos ? text.size() : lineEnd;
-        const size_t requestedCharacter =
-            static_cast<size_t>((std::max)(0L, character));
+        const LONG visibleCharacter = currentList_ == 651 && paragraph == 0 && character > textScanHiddenAt_
+            ? (std::max)(textScanHiddenAt_, character - textScanHiddenPrefix_) : character;
+        const size_t requestedCharacter = static_cast<size_t>((std::max)(0L, visibleCharacter));
         return lineStart + (std::min)(requestedCharacter, boundedEnd - lineStart);
     }
 
@@ -4989,6 +5152,9 @@ private:
             start + text.size(),
             &currentParagraph_,
             &currentCharacter_);
+        if (currentList_ == 651 && currentParagraph_ == 0 && currentCharacter_ >= textScanHiddenAt_) {
+            currentCharacter_ += textScanHiddenPrefix_;
+        }
         selectionMode_ = 0;
         selectedStartList_ = 0;
         selectedStartParagraph_ = 0;
@@ -5099,6 +5265,18 @@ private:
             {L"B3", 653, 3, 2, 1, 1, 28752, 30676, true, L"", body},
         };
         pendingReferenceFormat_ = body;
+    }
+
+    bool SelectReferenceTable(const std::wstring& tableId) {
+        if (tableId != L"reference-table" &&
+            !(twoReferenceTables_ && tableId == L"reference-table-b")) {
+            return false;
+        }
+        if (twoReferenceTables_ && tableId != selectedReferenceTableId_) {
+            referenceCells_.swap(otherReferenceCells_);
+        }
+        selectedReferenceTableId_ = tableId;
+        return true;
     }
 
     ReferenceCell* ReferenceCellByList(const LONG listId) noexcept {
@@ -5357,6 +5535,14 @@ private:
     }
 
     bool RunReferenceLayoutAction(const std::wstring& action) {
+        if (action == L"MoveParaEnd") {
+            const ReferenceCell* const cell = ReferenceCurrentCell();
+            if (cell == nullptr) { return false; }
+            currentCharacter_ = static_cast<LONG>(cell->text.size()) +
+                (currentList_ == 651 ? textScanHiddenPrefix_ : 0);
+            selectionMode_ = 0;
+            return true;
+        }
         if (action == L"Select") {
             // Turns block selection on at the caret. The next caret move is
             // what decides the other endpoint.
@@ -5565,6 +5751,10 @@ private:
     LONG pendingDocumentId_ = 0;
     FakeParameterArrayDispatch* parameterSet_ = new FakeParameterArrayDispatch();
     bool referenceLayoutFixture_ = false;
+    bool wrongReferenceControlIdentity_ = false;
+    bool twoReferenceTables_ = false;
+    std::wstring selectedReferenceTableId_ = L"reference-table";
+    std::vector<ReferenceCell> otherReferenceCells_;
     bool emptyCellTextFixture_ = false;
     bool emptyCellSelectAll_ = false;
     bool preflightSelectionFixture_ = false;
@@ -5714,6 +5904,13 @@ private:
     size_t atomicTailMaximumOccurrences_ = 0;
     bool scanStarted_ = false;
     bool scanReleased_ = false;
+    bool textLookupScan_ = false;
+    bool failTextScanRelease_ = false;
+    size_t findActionAttempts_ = 0;
+    LONG textScanHiddenPrefix_ = 0;
+    LONG textScanHiddenAt_ = 0;
+    size_t textScanReadbacks_ = 0;
+    std::vector<TextScanChunk> textScanChunks_;
     bool actionInputApplied_ = false;
     LONG scanStep_ = 0;
     std::wstring currentAction_;
@@ -7632,6 +7829,8 @@ int RunGraphDispatchAbi(
 }
 
 int wmain(const int argumentCount, wchar_t** const arguments) {
+    const bool publicCellTopologyMode = argumentCount == 3 &&
+        std::wcscmp(arguments[2], L"--public-cell-topology") == 0;
     const bool textFormatReadbackMode = argumentCount == 3 &&
         std::wcscmp(arguments[2], L"--text-format-readback") == 0;
     const bool formatRangeReadbackMode = argumentCount == 3 &&
@@ -7643,6 +7842,8 @@ int wmain(const int argumentCount, wchar_t** const arguments) {
         std::wcscmp(arguments[2], L"--automatic-number-text-patch") == 0;
     const bool findSelectionSurplusMode = argumentCount == 3 &&
         std::wcscmp(arguments[2], L"--find-selection-surplus") == 0;
+    const bool popupFreeTextSearchMode = argumentCount == 3 &&
+        std::wcscmp(arguments[2], L"--popup-free-text-search") == 0;
     const bool firstWriteReadbackMode = argumentCount == 3 &&
         std::wcscmp(arguments[2], L"--first-write-readback-failure") == 0;
     const bool helpMode = argumentCount == 2 &&
@@ -7753,7 +7954,7 @@ int wmain(const int argumentCount, wchar_t** const arguments) {
     if (helpMode) {
         std::wcout
             << L"BridgeSmoke modes: --schema --graph-store --graph-identity --hgn1 --patch-validate --hgn1-golden <output-root> --hgn1-page-spanning-table <output-root> --hgn1-large <field-bytes> --graphread-capability --graph-query --official-capability --virtual-property-get --text-patch-readback --text-patch-protocol\n"
-            << L"  <HancomLiveBridge.dll> --text-format-readback|--format-range-readback|--prepared-format-requested-readback|--automatic-number-text-patch|--find-selection-surplus|--first-write-readback-failure\n"
+            << L"  <HancomLiveBridge.dll> --text-format-readback|--format-range-readback|--prepared-format-requested-readback|--automatic-number-text-patch|--find-selection-surplus|--first-write-readback-failure|--public-cell-topology\n"
             << L"  --property-registry <registry|withdrawn|optional-absence|required-missing>\n"
             << L"  --probe --probe-twice --probe-output --probe-as-target\n"
             << L"  --run-as-target --run-as-target-stdin\n"
@@ -8198,6 +8399,201 @@ int wmain(const int argumentCount, wchar_t** const arguments) {
     documentBatchUnknown->Release();
     scopedBatchUnknown->Release();
     batchUnknown->Release();
+    if (publicCellTopologyMode) {
+        const std::array<const wchar_t*, 6> addresses{
+            L"A1", L"B1", L"A2", L"B2", L"A3", L"B3"};
+        const auto payloadFor = [&](const size_t count, const bool purple) {
+            std::wostringstream payload;
+            payload << L"HCA1\nDOC\t17\tQzpceC5od3A=\n";
+            for (size_t index = 0; index < count; ++index) {
+                payload << L"PATCH_TEXT\tCELL\tcmVmZXJlbmNlLXRhYmxl\t"
+                        << addresses[index]
+                        << L"\t1\t1\tb2xk\tbmV3\t1\n";
+                if (purple) {
+                    payload << L"ACTION\tCharShape\tHCharShape\n"
+                            << L"SET\tTextColor\tI4\t8388736\nENDACTION\n";
+                }
+            }
+            payload << L"END";
+            return payload.str();
+        };
+        bool passed = SUCCEEDED(dispatchStatus) && batch != nullptr;
+        for (const bool purple : {false, true}) {
+            for (const size_t count : {size_t{1}, size_t{2}, size_t{4}, size_t{6}}) {
+                dispatch->PreparePublicCellTopologyFixture();
+                const std::wstring payload = payloadFor(count, purple);
+                std::wstring preparation;
+                const bool prepared = batch != nullptr &&
+                    InvokeString(batch, L"PrepareTextPatches", payload.c_str(),
+                                 &preparation) &&
+                    preparation.rfind(L"HTP2\tOK\t", 0) == 0;
+                const size_t preparationScans =
+                    dispatch->PublicCellTopologyInspections();
+                const bool preparationPreserved =
+                    dispatch->PublicCellPatchStateMatches(0, false);
+                const std::wstring revision = DecodedResponseField(preparation, 2);
+                std::wstring execution;
+                const bool executed = prepared && !revision.empty() &&
+                    InvokeTwoStrings(batch, L"ExecutePreparedTextPatches",
+                                     payload.c_str(), revision.c_str(), &execution) &&
+                    execution.rfind(L"HCA2\tOK\t", 0) == 0;
+                const size_t executionScans =
+                    dispatch->PublicCellTopologyInspections() - preparationScans;
+                const bool stateMatches =
+                    dispatch->PublicCellPatchStateMatches(count, purple);
+                std::wstring replay;
+                const bool replayRejected = executed &&
+                    InvokeTwoStrings(batch, L"ExecutePreparedTextPatches",
+                                     payload.c_str(), revision.c_str(), &replay) &&
+                    replay.rfind(L"HCA2\tERROR\tSTALE_PREPARED_RECEIPT\t", 0) == 0 &&
+                    dispatch->PublicCellPatchStateMatches(count, purple) &&
+                    dispatch->PublicCellTopologyInspections() ==
+                        preparationScans + executionScans;
+                const bool casePassed = prepared && preparationPreserved &&
+                    executed && stateMatches && replayRejected &&
+                    preparationScans == 1 && executionScans == 1;
+                passed = casePassed && passed;
+                std::wcout << L"PUBLIC_CELL_TOPOLOGY count=" << count
+                           << L" purple=" << purple
+                           << L" preparation_scans=" << preparationScans
+                           << L" execution_scans=" << executionScans
+                           << L" preparation_preserved=" << preparationPreserved
+                           << L" state_matches=" << stateMatches
+                           << L" stale_receipt_rejected=" << replayRejected
+                           << L" passed=" << casePassed << L'\n';
+                if (!casePassed) {
+                    std::wcout << L"PUBLIC_CELL_PREPARATION " << preparation << L'\n'
+                               << L"PUBLIC_CELL_EXECUTION " << execution << L'\n'
+                               << L"PUBLIC_CELL_RECEIPT_REPLAY " << replay << L'\n';
+                }
+                dispatch->RestoreReferenceLayoutFixture();
+            }
+        }
+        for (const bool explicitEmpty : {false, true}) {
+            dispatch->PrepareEmptyPublicCellTopologyFixture();
+            const std::wstring forward =
+                L"HCA1\nDOC\t17\tQzpceC5od3A=\n"
+                L"PATCH_TEXT\tCELL\tcmVmZXJlbmNlLXRhYmxl\tA1\t0\t1\t\tbmV3\n"
+                L"PATCH_TEXT\tCELL\tcmVmZXJlbmNlLXRhYmxl\tB1\t0\t1\t\tbmV3\nEND";
+            const std::wstring prepare = explicitEmpty ? forward :
+                L"HCA1\nDOC\t17\tQzpceC5od3A=\n"
+                L"PREPARE_TEXT\tCELL\tcmVmZXJlbmNlLXRhYmxl\tA1\t0\t1\tbmV3\n"
+                L"PREPARE_TEXT\tCELL\tcmVmZXJlbmNlLXRhYmxl\tB1\t0\t1\tbmV3\nEND";
+            std::wstring preparation;
+            const bool prepared = InvokeString(batch, L"PrepareTextPatches", prepare.c_str(), &preparation) &&
+                preparation.rfind(L"HTP2\tOK\t", 0) == 0 &&
+                dispatch->PublicCellPatchStateMatches(0, false, true);
+            const std::wstring revision = DecodedResponseField(preparation, 2);
+            std::wstring execution;
+            const bool executed = prepared && InvokeTwoStrings(batch, L"ExecutePreparedTextPatches", forward.c_str(), revision.c_str(), &execution) &&
+                execution.rfind(L"HCA2\tOK\t", 0) == 0 &&
+                dispatch->PublicCellPatchStateMatches(2, false, true);
+            std::wstring stale;
+            const bool staleRejected = executed && InvokeString(batch, L"PrepareTextPatches", forward.c_str(), &stale) &&
+                stale.rfind(L"HTP2\tERROR\t", 0) == 0 &&
+                dispatch->PublicCellPatchStateMatches(2, false, true);
+            const bool emptyPassed = prepared && executed && staleRejected;
+            passed = emptyPassed && passed;
+            std::wcout << L"PUBLIC_EMPTY_CELL explicit=" << explicitEmpty << L" passed=" << emptyPassed << L'\n';
+            if (!emptyPassed) std::wcout << preparation << L'\n' << execution << L'\n' << stale << L'\n';
+            dispatch->RestoreReferenceLayoutFixture();
+        }
+        dispatch->PreparePublicTwoTableTopologyFixture();
+        constexpr wchar_t switchPayload[] =
+            L"HCA1\nDOC\t17\tQzpceC5od3A=\n"
+            L"PATCH_TEXT\tCELL\tcmVmZXJlbmNlLXRhYmxl\tA1\t1\t1\tb2xkLWE=\tbmV3\t1\n"
+            L"ACTION\tCharShape\tHCharShape\nSET\tTextColor\tI4\t8388736\nENDACTION\n"
+            L"PATCH_TEXT\tCELL\tcmVmZXJlbmNlLXRhYmxlLWI=\tA1\t1\t1\tb2xkLWI=\tbmV3\t1\n"
+            L"ACTION\tCharShape\tHCharShape\nSET\tTextColor\tI4\t8388736\nENDACTION\n"
+            L"PATCH_TEXT\tCELL\tcmVmZXJlbmNlLXRhYmxl\tB1\t1\t1\tb2xkLWE=\tbmV3\t1\n"
+            L"ACTION\tCharShape\tHCharShape\nSET\tTextColor\tI4\t8388736\nENDACTION\nEND";
+        std::wstring switchPreparation;
+        const bool switchPrepared = batch != nullptr &&
+            InvokeString(batch, L"PrepareTextPatches", switchPayload, &switchPreparation) &&
+            switchPreparation.rfind(L"HTP2\tOK\t", 0) == 0;
+        const size_t switchPreparationScans = dispatch->PublicCellTopologyInspections();
+        const bool switchPreserved = dispatch->PublicTwoTableStateMatches(false);
+        const std::wstring switchRevision = DecodedResponseField(switchPreparation, 2);
+        std::wstring switchExecution;
+        const bool switchExecuted = switchPrepared && !switchRevision.empty() &&
+            InvokeTwoStrings(batch, L"ExecutePreparedTextPatches", switchPayload,
+                             switchRevision.c_str(), &switchExecution) &&
+            switchExecution.rfind(L"HCA2\tOK\t", 0) == 0;
+        const size_t switchExecutionScans =
+            dispatch->PublicCellTopologyInspections() - switchPreparationScans;
+        const bool switchPassed = switchPrepared && switchPreserved && switchExecuted &&
+            dispatch->PublicTwoTableStateMatches(true) &&
+            switchPreparationScans == 3 && switchExecutionScans == 3;
+        passed = switchPassed && passed;
+        std::wcout << L"PUBLIC_CELL_TABLE_SWITCH sequence=A-B-A preparation_scans="
+                   << switchPreparationScans << L" execution_scans=" << switchExecutionScans
+                   << L" preparation_preserved=" << switchPreserved
+                   << L" passed=" << switchPassed << L'\n';
+        if (!switchPassed) {
+            std::wcout << L"PUBLIC_CELL_SWITCH_PREPARATION " << switchPreparation << L'\n'
+                       << L"PUBLIC_CELL_SWITCH_EXECUTION " << switchExecution << L'\n';
+        }
+        dispatch->RestoreReferenceLayoutFixture();
+        const std::array<std::pair<const wchar_t*, const wchar_t*>, 3> refusals{{
+            {L"missing_cell", L"PATCH_TEXT\tCELL\tcmVmZXJlbmNlLXRhYmxl\tZ9\t1\t1\tb2xk\tbmV3\t1\n"},
+            {L"stale_text", L"PATCH_TEXT\tCELL\tcmVmZXJlbmNlLXRhYmxl\tB1\t1\t1\tbWlzc2luZw==\tbmV3\t1\n"},
+            {L"overlap", L"PATCH_TEXT\tCELL\tcmVmZXJlbmNlLXRhYmxl\tA1\t1\t1\tb2xk\tbmV3\t1\n"},
+        }};
+        for (const auto& [name, rejectedPatch] : refusals) {
+            dispatch->PreparePublicCellTopologyFixture();
+            const std::wstring payload =
+                std::wstring(L"HCA1\nDOC\t17\tQzpceC5od3A=\n") +
+                L"PATCH_TEXT\tCELL\tcmVmZXJlbmNlLXRhYmxl\tA1\t1\t1\tb2xk\tbmV3\t1\n" +
+                rejectedPatch + L"END";
+            std::wstring response;
+            const bool refused = batch != nullptr &&
+                InvokeString(batch, L"PrepareTextPatches", payload.c_str(), &response) &&
+                response.rfind(L"HTP2\tERROR\t1\t", 0) == 0 &&
+                dispatch->PublicCellPatchStateMatches(0, false);
+            passed = refused && passed;
+            std::wcout << L"PUBLIC_CELL_GUARD name=" << name
+                       << L" preserved=" << refused
+                       << L" response=" << response << L'\n';
+            dispatch->RestoreReferenceLayoutFixture();
+        }
+        dispatch->PreparePublicCellTopologyFixture();
+        dispatch->SetWrongReferenceControlIdentity(true);
+        const std::wstring wrongControlPayload = payloadFor(2, true);
+        std::wstring wrongControlResponse;
+        const bool wrongControlRefused = batch != nullptr &&
+            InvokeString(batch, L"PrepareTextPatches", wrongControlPayload.c_str(),
+                         &wrongControlResponse) &&
+            wrongControlResponse.rfind(L"HTP2\tERROR\t0\tWRONG_CONTROL\t", 0) == 0 &&
+            dispatch->PublicCellPatchStateMatches(0, false);
+        passed = wrongControlRefused && passed;
+        std::wcout << L"PUBLIC_CELL_WRONG_CONTROL preserved=" << wrongControlRefused
+                   << L" response=" << wrongControlResponse << L'\n';
+        dispatch->SetWrongReferenceControlIdentity(false);
+        dispatch->RestoreReferenceLayoutFixture();
+        dispatch->PrepareRunTopologyInvalidationFixture();
+        constexpr wchar_t structuralPayload[] =
+            L"HCA1\nDOC\t17\tQzpceC5od3A=\n"
+            L"SELECT_CONTROL\tcmVmZXJlbmNlLXRhYmxl\nCAPTURE_TABLE\n"
+            L"CELL\tA1\nRUN\tTableDeleteRow\nCELL\tB1\nEND";
+        std::wstring structuralResponse;
+        const bool invalidated = batch != nullptr &&
+            InvokeString(batch, L"ExecuteActions", structuralPayload,
+                         &structuralResponse) &&
+            structuralResponse.rfind(L"HCA2\tOK\t5\t", 0) == 0 &&
+            dispatch->TopologyWasInvalidatedAfterRunDeleteRow();
+        passed = invalidated && passed;
+        std::wcout << L"PUBLIC_CELL_STRUCTURE_INVALIDATED " << invalidated
+                   << L" response=" << structuralResponse << L'\n'
+                   << (passed ? L"PASS PUBLIC CELL TOPOLOGY\n"
+                              : L"FAIL PUBLIC CELL TOPOLOGY\n");
+        if (batch != nullptr) {
+            batch->Release();
+        }
+        const HRESULT revokeStatus = releasePublication();
+        FreeLibrary(library);
+        CoUninitialize();
+        return passed && SUCCEEDED(revokeStatus) ? 0 : 46;
+    }
     if (firstWriteReadbackMode) {
         constexpr wchar_t payload[] =
             L"HCA1\nDOC\t17\tQzpceC5od3A=\n"
@@ -8220,6 +8616,189 @@ int wmain(const int argumentCount, wchar_t** const arguments) {
         FreeLibrary(library);
         CoUninitialize();
         return passed && SUCCEEDED(revokeStatus) ? 0 : 41;
+    }
+    if (popupFreeTextSearchMode) {
+        using Chunk = FakeDispatch::TextScanChunk;
+        const bool usable = SUCCEEDED(dispatchStatus) && batch != nullptr;
+        bool passed = usable;
+        const auto run = [&](const wchar_t* label, const std::wstring& text,
+                const std::wstring& needle, std::vector<Chunk> chunks,
+                const LONG occurrence, const bool matchCase,
+                const wchar_t* error, const std::wstring& expected,
+                const bool failRelease = false, const bool wholeDocument = false,
+                const LONG hiddenPrefix = 0) {
+            dispatch->PrepareTextScanFixture(text, std::move(chunks), failRelease, hiddenPrefix);
+            const std::wstring payload =
+                L"HCA1\nDOC\t17\tQzpceC5od3A=\nPATCH_TEXT\tFIND\t" +
+                std::wstring(wholeDocument ? L"" : L"cmVmZXJlbmNlLXRhYmxl\tB2\t") +
+                std::to_wstring(occurrence) + L"\t" + (matchCase ? L"1" : L"0") +
+                L"\t" + EncodeUtf8Base64(needle) + L"\tbmV3\nEND";
+            std::wstring response;
+            const bool success = usable &&
+                InvokeString(batch, L"ExecuteActions", payload.c_str(), &response) &&
+                (error == nullptr
+                    ? response.rfind(L"HCA2\tOK\t", 0) == 0
+                    : response.rfind(L"HCA2\tERROR\t", 0) == 0 &&
+                      response.find(error) != std::wstring::npos) &&
+                dispatch->FindSelectionSurplusCellText() == expected &&
+                dispatch->TextScanWasPopupFree() && dispatch->TextScanReadbacks() <= 32;
+            std::wcout << L"POPUP_FREE_" << label << L" " << success
+                       << L" scan_steps=" << dispatch->TextScanSteps()
+                       << L" selected_readbacks=" << dispatch->TextScanReadbacks() << L'\n';
+            if (!success) { std::wcout << response << L'\n'; }
+            passed = success && passed;
+        };
+        run(L"LITERAL", L"the old", L"old", {{2,651,0,0,L"the old"}},
+            0, true, nullptr, L"the new");
+        run(L"UNICODE", L"\U0001F600 \uC124\uBA85 \uBC14\uAFB8\uAE30 \uB05D", L"\uBC14\uAFB8\uAE30",
+            {{3,651,0,0,L"\U0001F600 \uC124\uBA85 \uBC14\uAFB8\uAE30 \uB05D\r\n"}},
+            0, true, nullptr, L"\U0001F600 \uC124\uBA85 new \uB05D");
+        run(L"REGEX_LITERAL", L"aXb a.b[0]", L"a.b[0]",
+            {{2,651,0,0,L"aXb a.b[0]"}}, 0, true, nullptr, L"aXb new");
+        run(L"AMBIGUOUS", L"old old", L"old", {{2,651,0,0,L"old old"}},
+            0, true, L"AMBIGUOUS_TEXT_MATCH", L"old old");
+        run(L"SECOND", L"old old", L"old", {{2,651,0,0,L"old old"}},
+            2, true, nullptr, L"old new");
+        run(L"CASE_INSENSITIVE", L"OLD", L"old", {{2,651,0,0,L"OLD"}},
+            0, false, nullptr, L"new");
+        run(L"CASE_SENSITIVE", L"OLD", L"old", {{2,651,0,0,L"OLD"}},
+            0, true, L"TEXT_NOT_FOUND", L"OLD");
+        run(L"MISSING", L"none", L"old", {{2,651,0,0,L"none"}},
+            0, true, L"TEXT_NOT_FOUND", L"none");
+        run(L"MISSING_OCCURRENCE", L"old", L"old", {{2,651,0,0,L"old"}},
+            2, true, L"TEXT_OCCURRENCE_NOT_FOUND", L"old");
+        run(L"CONTIGUOUS_CHUNKS", L"the old", L"old",
+            {{2,651,0,0,L"the o"},{2,651,0,5,L"ld"}},
+            0, true, nullptr, L"the new");
+        run(L"REPEATED_PREFIX", L"aaaaab", L"aaab",
+            {{2,651,0,0,L"aaaa"},{2,651,0,4,L"ab"}},
+            0, true, nullptr, L"aanew");
+        run(L"NON_OVERLAPPING", L"aaaaa", L"aaa", {{2,651,0,0,L"aaaaa"}},
+            2, true, L"TEXT_OCCURRENCE_NOT_FOUND", L"aaaaa");
+        run(L"LONG_REPEATED_PREFIX", std::wstring(80'000, L'a'),
+            std::wstring(4'096, L'a') + L'b', {{2,651,0,0,std::wstring(80'000, L'a')}},
+            0, true, L"TEXT_NOT_FOUND", std::wstring(80'000, L'a'), false, true);
+        run(L"CONTROL_BOUNDARY", L"old", L"old",
+            {{2,651,0,0,L"o"},{4,651,0,1,L""},{2,651,0,1,L"ld"}},
+            0, true, L"TEXT_NOT_FOUND", L"old");
+        run(L"PARAGRAPH_BOUNDARY", L"old", L"old",
+            {{3,651,0,0,L"o\r\n"},{2,651,1,0,L"ld"}},
+            0, true, L"TEXT_NOT_FOUND", L"old");
+        run(L"EMPTY_CONTROL", L"old", L"old",
+            {{0,651,0,0,L""},{4,651,0,0,L""},{2,651,0,0,L"old"}},
+            0, true, nullptr, L"new");
+        run(L"FINAL_CHUNK", L"old", L"old", {{1,651,0,0,L"old"}},
+            0, true, nullptr, L"new");
+        run(L"SHIFTED_POSITION_RECOVERED", L"the old", L"old", {{2,651,0,0,L"old"}},
+            0, true, nullptr, L"the new");
+        run(L"HIDDEN_PREFIX_RECOVERED", L"the old", L"old", {{2,651,0,0,L"the old"}},
+            0, true, nullptr, L"the new", false, true, 1024);
+        run(L"SHIFTED_AMBIGUOUS_REFUSED", L"the old old", L"old", {{2,651,0,0,L"old"}},
+            1, true, L"STALE_SELECTION_TEXT", L"the old old");
+        run(L"SHIFTED_MISSING_REFUSED", L"the new", L"old", {{2,651,0,0,L"old"}},
+            0, true, L"STALE_SELECTION_TEXT", L"the new");
+        run(L"WRONG_CELL", L"old", L"old", {{2,650,0,0,L"old"}},
+            0, true, L"TEXT_SCAN_STATE", L"old");
+        run(L"WHOLE_DOCUMENT_SUBLIST", L"old", L"old",
+            {{2,0,0,0,L"intro"},{4,0,0,5,L""},{2,651,0,0,L"old"}},
+            0, true, nullptr, L"new", false, true);
+        run(L"WHOLE_DOCUMENT_AMBIGUOUS", L"old", L"old",
+            {{2,0,0,0,L"old"},{2,651,0,0,L"old"}},
+            0, true, L"AMBIGUOUS_TEXT_MATCH", L"old", false, true);
+        run(L"SCAN_ERROR", L"old", L"old", {{102,651,0,0,L"old"}},
+            0, true, L"TEXT_SCAN_STATE", L"old", false, true);
+        run(L"RELEASE_ERROR", L"old", L"old", {{2,651,0,0,L"old"}},
+            1, true, L"TEXT_SCAN_STATE", L"old", true, true);
+        run(L"SCAN_LIMIT", L"old", L"old",
+            std::vector<Chunk>(20'000, Chunk{0,651,0,0,L""}),
+            0, true, L"TEXT_SEARCH_LIMIT", L"old");
+        const auto literal = [&](const wchar_t* label, const std::wstring& text,
+                const std::vector<std::pair<LONG, LONG>>& spans, LONG hidden, LONG hiddenAt,
+                const wchar_t* error = nullptr, const std::wstring& inspected = L"") {
+            dispatch->PrepareTextScanFixture(text, {}, false, hidden, hiddenAt);
+            const std::wstring& source = inspected.empty() ? text : inspected;
+            std::wostringstream payload;
+            payload << L"HCA1\nDOC\t17\tQzpceC5od3A=\n";
+            for (const auto& span : spans) {
+                payload << L"PREPARE_TEXT\tLITERAL_RANGE\t651\t0\t" << span.first << L'\t'
+                        << span.second << L'\t' << EncodeUtf8Base64(source) << L'\t'
+                        << EncodeUtf8Base64(source.substr(span.first, span.second - span.first))
+                        << L"\tbmV3\n";
+            }
+            payload << L"END";
+            std::wstring response;
+            bool success = usable && InvokeString(batch, L"PrepareLiteralTextPatches",
+                payload.str().c_str(), &response);
+            const auto fields = SplitTabs(response);
+            if (error != nullptr) {
+                success = success && response.rfind(L"HTP2\tERROR\t", 0) == 0 &&
+                    response.find(error) != std::wstring::npos;
+            } else {
+                success = success && response.rfind(L"HTP2\tOK\t", 0) == 0 &&
+                    fields.size() == 5 + 12 * spans.size();
+                for (size_t index = 0; success && index < spans.size(); ++index) {
+                    const auto span = spans[index];
+                    const LONG start = span.first + (span.first >= hiddenAt ? hidden : 0);
+                    const LONG end = span.second + (span.second > hiddenAt ? hidden : 0);
+                    success = fields[7 + index * 12] == std::to_wstring(start) &&
+                        fields[10 + index * 12] == std::to_wstring(end) &&
+                        DecodedResponseField(response, 11 + index * 12) ==
+                            text.substr(span.first, span.second - span.first);
+                }
+            }
+            const size_t reads = dispatch->TextScanReadbacks();
+            success = success && dispatch->FindSelectionSurplusCellText() == text &&
+                dispatch->TextScanDidNotSearch() && reads <= 32 + spans.size() * 6;
+            std::wstring expected = text;
+            if (error == nullptr && success) {
+                std::wostringstream forward;
+                forward << L"HCA1\nDOC\t17\tQzpceC5od3A=\n";
+                for (size_t index = 0; index < spans.size(); ++index) {
+                    forward << L"PATCH_TEXT\tRANGE";
+                    for (size_t coordinate = 0; coordinate < 6; ++coordinate) {
+                        forward << L'\t' << fields[5 + index * 12 + coordinate];
+                    }
+                    forward << L'\t' << fields[11 + index * 12] << L"\tbmV3\n"
+                            << L"ACTION\tCharShape\tHCharShape\nSET\tTextColor\tI4\t255\nENDACTION\n";
+                    expected.replace(spans[index].first, spans[index].second - spans[index].first, L"new");
+                }
+                forward << L"END";
+                const std::wstring revision = DecodedResponseField(response, 2);
+                std::wstring execution;
+                success = InvokeTwoStrings(batch, L"ExecutePreparedTextPatches", forward.str().c_str(),
+                    revision.c_str(), &execution) && execution.rfind(L"HCA2\tOK\t", 0) == 0 &&
+                    dispatch->FindSelectionSurplusCellText() == expected;
+                if (!success) { std::wcout << execution << L'\n'; }
+            }
+            // Read-only records are rejected by the mutation endpoint.
+            std::wstring mutation;
+            success = InvokeString(batch, L"ExecuteActions", payload.str().c_str(), &mutation) &&
+                mutation.rfind(L"HCA2\tERROR\t", 0) == 0 &&
+                dispatch->FindSelectionSurplusCellText() == expected && success;
+            std::wcout << L"LITERAL_RANGE_" << label << L" " << success
+                       << L" targets=" << spans.size() << L" readbacks=" << reads << L'\n';
+            if (!success) { std::wcout << response << L'\n' << mutation << L'\n'; }
+            passed = success && passed;
+        };
+        literal(L"PREFIX", L"old end", {{0,3}}, 1024, 0);
+        literal(L"REPEATED", L"10 20 10", {{6,8}}, 2, 0);
+        literal(L"UNICODE", L"\U0001F600 old end", {{3,6}}, 9, 0);
+        literal(L"END_BEFORE_CONTROL", L"old end", {{0,3}}, 7, 3);
+        literal(L"START_AFTER_CONTROL", L"old end", {{4,7}}, 7, 4);
+        literal(L"CONTROL_INSIDE_REFUSED", L"old end", {{0,3}}, 7, 1, L"TEXT_RANGE_CONTROL");
+        literal(L"STALE_CONTEXT", L"new end", {{0,3}}, 2, 0, L"STALE_SELECTION_TEXT", L"old end");
+        std::wstring numbers;
+        std::vector<std::pair<LONG, LONG>> spans;
+        for (LONG index = 0; index < 64; ++index) {
+            numbers += L"10 ";
+            spans.insert(spans.begin(), {index * 3, index * 3 + 2});
+        }
+        literal(L"SHARED_PARAGRAPH", numbers, spans, 1024, 0);
+        if (batch != nullptr) { batch->Release(); }
+        const HRESULT revokeStatus = releasePublication();
+        FreeLibrary(library);
+        CoUninitialize();
+        return passed && SUCCEEDED(revokeStatus) ? 0 : 46;
     }
     if (findSelectionSurplusMode) {
         // Find "old" inside a cell reading "the old" and replace it with

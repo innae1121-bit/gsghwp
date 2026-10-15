@@ -139,14 +139,32 @@ def inspect_candidate_context(
         page.text,
         page_setup,
     )
+    # This is the same live parameter-set read used by the page setup adapter;
+    # the older native CHAR record does not include spacing. Missing evidence
+    # stays null, never an invented zero.
+    try:
+        spacing = hwp.get_charshape_as_dict().get("SpacingHangul")
+    except AttributeError:
+        spacing = None
+    guard()
+    letter_spacing = (
+        spacing
+        if isinstance(spacing, int)
+        and not isinstance(spacing, bool)
+        and -50 <= spacing <= 50
+        else None
+    )
     return context.model_copy(
         update={
+            "character_style": context.character_style.model_copy(
+                update={"letter_spacing_percent": letter_spacing}
+            ),
             "paragraph_style": _enrich_numbering_from_native_scan(
                 candidate,
                 snapshot,
                 context.paragraph_style,
                 guard,
-            )
+            ),
         }
     )
 

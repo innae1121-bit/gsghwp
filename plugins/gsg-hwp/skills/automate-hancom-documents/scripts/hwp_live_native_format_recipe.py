@@ -12,6 +12,7 @@ from hwp_live_native_action_contract import NativeActionFailure
 from hwp_live_native_action_commands import (
     CaptureTableCommand,
     CellCommand,
+    MovePositionCommand,
     RunCommand,
     SelectControlCommand,
 )
@@ -20,6 +21,7 @@ from hwp_live_native_action_models import (
     NativeCellFormat,
     NativeDetailedCell,
     NativeDetailedInspection,
+    NativePosition,
     NativeSnapshot,
 )
 from hwp_live_native_batch import (
@@ -80,6 +82,8 @@ from hwp_live_native_format_target import (
 )
 from hwp_live_native_layout_format import cell_format_commands
 from hwp_live_table_contract import TableCell
+from hwp_live_table_size_protection import execute_table_size_protection
+from hwp_live_table_format_copy import execute_table_format_copy
 from hwp_live_text_format_verification import (
     verify_requested_text_format,
     verify_text_format,
@@ -643,9 +647,7 @@ def _content_minimum_height(
         return None
     horizontal, vertical = _cell_margins(cell_format, requested)
     content_width = (
-        None
-        if cell.width_hwpunit is None
-        else max(1, cell.width_hwpunit - horizontal)
+        None if cell.width_hwpunit is None else max(1, cell.width_hwpunit - horizontal)
     )
     lines = wrapped_line_count(cell.text, style, content_width)
     return lines * line_height + vertical
@@ -800,9 +802,7 @@ def _rectangular_cell_blocks(
         for address, cell in selected.items()
         if cell.row_span != 1 or cell.column_span != 1
     )
-    verified = tuple(
-        address for target in targets for address in target.addresses
-    )
+    verified = tuple(address for target in targets for address in target.addresses)
     if frozenset(verified) != frozenset(selected) or len(verified) != len(selected):
         return None
     return tuple(
@@ -940,14 +940,18 @@ def _selected_structure_addresses(
     if detail is None:
         return (), None
     selection = before.selection
-    if (selection.mode & 0x0F) == 3 and selection.cell_addresses:
-        return tuple(selection.cell_addresses), None
     try:
+        topology = table_topology(detail, resolved.instance_id)
+        if (
+            (selection.mode & 0x0F) == 3
+            and selection.cell_addresses
+            and before.control_instance_id == resolved.instance_id
+        ):
+            return topology.selection_region_by_addresses(
+                selection.cell_addresses
+            ), detail
         return (
-            table_topology(
-                detail,
-                resolved.instance_id,
-            ).selection_region_by_list_ids(
+            topology.selection_region_by_list_ids(
                 selection.start.list_id,
                 selection.end.list_id,
             ),
@@ -1028,10 +1032,14 @@ def _normalized_merge_plan(
     if end_row >= start_row and end_column >= start_column:
         return prepared
     try:
-        region = table_topology(
-            before_detail,
-            plan.table.instance_id,
-        ).selection_region_by_addresses((start, end))
+        topology = table_topology(before_detail, plan.table.instance_id)
+        first = topology.by_address.get(start.upper())
+        second = topology.by_address.get(end.upper())
+        if first is None or second is None:
+            raise HwpLiveError("병합 시작·끝 셀이 실제 표 토폴로지에 없습니다")
+        # Explicit merge endpoints must be physical cells even when reversed;
+        # grid aliases are only meaningful in an observed native selection.
+        region = topology.selection_region_by_list_ids(first.list_id, second.list_id)
     except HwpLiveError as error:
         return InputFailure("schema_conflict", str(error))
     if len(region) < 2:
@@ -1076,8 +1084,9 @@ def topology_preflight(
                         "인접 위치가 모두 같은 열 범위를 덮는 기존 병합 span이거나 "
                         f"표 경계입니다. 인접 행 현재 span: {neighbours}. "
                         "시도하면 인접 span 메타데이터가 손상되며 사후 검증의 "
-                        "자동 Undo가 복원합니다. 표를 새로 만들어 재구성하는 "
-                        "hwp_restructure_table 경로를 사용하세요. "
+                        "자동 Undo가 복원합니다. 이미 나뉜 제목 칸의 입력은 "
+                        "hwp_fill_table을 사용하세요. hwp_restructure_table은 "
+                        "사진·라벨 전용이며 본문이 있는 표의 병합 우회에 사용하지 마세요. "
                         "mutation_started=false",
                     )
             case SplitCommandPlan():
@@ -1177,22 +1186,6 @@ def _resolve_selected_table_cells(
     )
 
 
-def _fallback_axis_targets(
-    cells: tuple[str, ...],
-    *,
-    column: bool,
-) -> tuple[AxisSizeTarget, ...]:
-    label = "column" if column else "row"
-    return tuple(
-        AxisSizeTarget(
-            f"{label}:fallback:{index}",
-            address,
-            (address,),
-        )
-        for index, address in enumerate(cells)
-    )
-
-
 def _topology_axis_targets(
     prepared: PreparedFormatOperation,
     detail: NativeDetailedInspection,
@@ -1242,7 +1235,11 @@ def _topology_axis_targets(
             None,
         )
         if anchor is None:
-            return _fallback_axis_targets(plan.cells, column=column)
+            raise HwpLiveError(
+                f"표 {label} {axis}의 크기를 독립적으로 변경할 "
+                "single-span 셀이 없습니다. 병합 셀로 축을 선택하면 다른 "
+                "행·열까지 바뀔 수 있어 변경 전에 중단했습니다."
+            )
         affected = tuple(
             cell.address
             for cell in physical
@@ -1275,7 +1272,7 @@ def _with_topology_size_targets(
     detail: NativeDetailedInspection,
 ) -> PreparedFormatOperation:
     plan = prepared.plan
-    if not isinstance(plan, TableFormatCommandPlan) or len(plan.cells) < 2:
+    if not isinstance(plan, TableFormatCommandPlan):
         return prepared
     formatted = plan.formatting
     column_targets = (
@@ -1317,6 +1314,11 @@ def _topology_cell_geometry_targets(
     selected = tuple(topology.by_address.get(address.upper()) for address in plan.cells)
     if any(cell is None for cell in selected):
         raise HwpLiveError("셀 geometry 변경 대상이 실제 CellTopology에 없습니다")
+    if plan.formatting.formatting.borders is not None:
+        # Border sides describe each requested cell. HWP applies those same
+        # parameters to the outer edges of a selected block, so coalescing
+        # cells would silently omit the interior edges.
+        return None, topology.cell_count
     physical = tuple(cell for cell in selected if cell is not None)
     if any(cell.row_span != 1 or cell.column_span != 1 for cell in physical):
         # NativeDetailedCell does not expose the native right/down neighbour
@@ -1807,11 +1809,55 @@ def _execute_prepared(
     before_detail: NativeDetailedInspection | None = None,
 ) -> OperationResult:
     plan = prepared.plan
+    selection_commands = 0
+    selection_elapsed = 0
+    if isinstance(plan, TextFormatCommandPlan) and plan.whole_body:
+        selected = execute_native_actions(
+            request.candidate.window_handle,
+            NativeActionRequest(
+                request.routing_page.document_id,
+                request.routing_page.full_name,
+                (MovePositionCommand(NativePosition(0, 0, 0)), RunCommand("SelectAll")),
+            ),
+            minimum_version=9,
+        )
+        if selected is None:
+            raise HwpLiveError("문서 전체 텍스트 선택을 실행하지 못했습니다")
+        whole_before = read_native_snapshot(request.candidate.window_handle)
+        if (
+            whole_before is None
+            or not whole_before.selection.selected
+            # SelectAll may start after section/header control codes in the
+            # first body paragraph. Those codes are not editable text.
+            or whole_before.selection.start.list_id != 0
+            or whole_before.selection.start.paragraph != 0
+            or whole_before.selection.end.list_id != 0
+            or whole_before.document_id != before.document_id
+            or whole_before.full_name != before.full_name
+        ):
+            raise HwpLiveError("문서 전체 텍스트 선택을 확인하지 못했습니다")
+        before = whole_before
+        selection_commands = selected.commands_executed
+        selection_elapsed = selected.elapsed_microseconds
+    if (
+        isinstance(plan, TableFormatCommandPlan)
+        and plan.formatting.format_source_table_id is not None
+    ):
+        return execute_table_format_copy(
+            request, before, prepared, _result(request, "executed", "")
+        )
+    if (
+        isinstance(plan, TableFormatCommandPlan)
+        and plan.formatting.protect_size is not None
+    ):
+        return execute_table_size_protection(
+            request, before, prepared, _result(request, "executed", "")
+        )
     detail_page: int | None = None
     match plan:  # noqa: E501  # noqa: MATCH_OK — closed union is fully enumerated
         case TableFormatCommandPlan():
             formatted = plan.formatting
-            needs_axis_topology = len(plan.cells) > 1 and (
+            needs_axis_topology = (
                 formatted.column_width_mm is not None
                 or formatted.row_height_mm is not None
             )
@@ -1935,13 +1981,20 @@ def _execute_prepared(
     if (
         isinstance(plan, TableFormatCommandPlan)
         and before_detail is not None
-        and len(plan.cells) > 1
         and (
             plan.formatting.column_width_mm is not None
             or plan.formatting.row_height_mm is not None
         )
     ):
-        prepared = _with_topology_size_targets(prepared, before_detail)
+        try:
+            prepared = _with_topology_size_targets(prepared, before_detail)
+        except HwpLiveError as error:
+            return _pre_mutation_failure(
+                request,
+                before,
+                prepared,
+                InputFailure("schema_conflict", str(error)),
+            )
         plan = prepared.plan
     if (
         isinstance(plan, TableFormatCommandPlan)
@@ -2021,6 +2074,9 @@ def _execute_prepared(
         commands_executed = native.commands_executed
         elapsed_microseconds = native.elapsed_microseconds
         native_call_count = 1
+    commands_executed += selection_commands
+    elapsed_microseconds += selection_elapsed
+    native_call_count += int(selection_commands > 0)
     after = read_native_snapshot(request.candidate.window_handle)
     if after is None:
         raise HwpLiveError("네이티브 서식 작업 후 문서 상태를 읽지 못했습니다")

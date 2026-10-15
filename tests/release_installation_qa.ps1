@@ -159,14 +159,6 @@ $documentationClaimAllowlist = @(
         Consumed = $false
     },
     [pscustomobject][ordered]@{
-        File = "README.md"
-        Check = "semver"
-        Token = "1.6.1"
-        LineSha256 = "c96abf5d6bebbbd2cc98c1bb8507ffadadad406d7827dea534d096b249d3b090"
-        Reason = "Names the previous release the current section compares itself against, not a version this build ships"
-        Consumed = $false
-    },
-    [pscustomobject][ordered]@{
         File = "docs\release-integrity.md"
         Check = "semver"
         Token = "1.2.4"
@@ -177,8 +169,8 @@ $documentationClaimAllowlist = @(
     [pscustomobject][ordered]@{
         File = "docs\release-integrity.md"
         Check = "api_count"
-        Token = "4,239,297"
-        LineSha256 = "49354f2e94f6d7d79a895e0055f0e2eafc3509280f44bf928aa5c4ac85b6f3f9"
+        Token = "4,365,083"
+        LineSha256 = "6e5bbcff4abb28f4dc1588daa4609b2c312b365b6c955a40c5f5135ca8fdd33c"
         Reason = "The release archive is built by CI, so neither its SHA-256 nor its size can be recomputed here. Pinning the whole row sends any edit to either value back through review"
         Consumed = $false
     }

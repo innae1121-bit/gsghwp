@@ -221,10 +221,40 @@ def refresh_runtime_source_state(
 
 
 def runtime_source_hash(paths: Sequence[Path]) -> str:
+    """Hash ``paths`` outright. Authoritative, and never fingerprint-gated.
+
+    Callers that re-ask for the *same* watch roots on a cycle should use
+    ``current_runtime_source_hash`` instead; this one stays uncached so the
+    release tooling and the tests keep an unconditional second opinion.
+    """
     return runtime_source_state(paths).content_hash
 
 
-RUNTIME_LOADED_SOURCE_HASH: Final = runtime_source_hash(RUNTIME_WATCH_PATHS)
+_RUNTIME_LOADED_SOURCE_STATE: Final = runtime_source_state(RUNTIME_WATCH_PATHS)
+RUNTIME_LOADED_SOURCE_HASH: Final = _RUNTIME_LOADED_SOURCE_STATE.content_hash
+_runtime_watch_state: RuntimeSourceState = _RUNTIME_LOADED_SOURCE_STATE
+
+
+def current_runtime_source_hash() -> str:
+    """The watch roots' hash now, re-reading bytes only when a stat moved.
+
+    ``runtime_source_hash`` re-hashes 378 files / 6.8MB every time, which the
+    worker paid once per cycle just to answer ``hwp_runtime_info``. The
+    fingerprint (size, mtime_ns, ctime_ns over every watched directory *and*
+    file) decides instead: an added or removed file moves its directory's stat,
+    a deleted file raises and falls through to a full rescan, and edited bytes
+    move that file's own stat -- so an unchanged fingerprint means the same file
+    set and the same bytes, and the cached hash is the hash. This is the very
+    gate ``HwpWorkerSupervisor`` already reloads on
+    (``hwp_mcp_worker_supervisor.py`` :360, :398, :462); the reading here is not
+    a weaker one, just the same one applied in the worker process.
+    """
+    global _runtime_watch_state
+    _runtime_watch_state = refresh_runtime_source_state(
+        _runtime_watch_state,
+        RUNTIME_WATCH_PATHS,
+    )
+    return _runtime_watch_state.content_hash
 
 
 def tool_schema_hash(tools: Sequence[Tool]) -> str:
@@ -388,7 +418,7 @@ def native_bridge_runtime() -> NativeBridgeRuntime:
 
 
 def runtime_status(tools: Sequence[Tool]) -> RuntimeStatus:
-    current_source_hash = runtime_source_hash(RUNTIME_WATCH_PATHS)
+    current_source_hash = current_runtime_source_hash()
     process_id = os.getpid()
     bridge = native_bridge_runtime()
     return RuntimeStatus(

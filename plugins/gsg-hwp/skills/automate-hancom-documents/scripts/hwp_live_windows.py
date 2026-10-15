@@ -1482,7 +1482,15 @@ class Win32WindowStateReader:
                     ),
                     None,
                 )
-            if (
+            wpf_close = any(
+                control.source == "uia"
+                and control.automation_id == "PART_Close"
+                and control.visible
+                and control.enabled
+                and not control.actionable
+                for control in public_controls
+            )
+            if wpf_close or (
                 not any(control.actionable for control in public_controls)
                 and self._gui.GetWindowLong(dialog_window_handle, _GWL_STYLE)
                 & _WS_SYSMENU
@@ -1527,12 +1535,22 @@ class Win32WindowStateReader:
         if not selected.actionable:
             raise ValueError(f"control_id {control_id} is not an actionable control")
         if selected.source == "window":
+            wpf_close = any(
+                control.source == "uia"
+                and control.automation_id == "PART_Close"
+                and control.visible
+                and control.enabled
+                for control in before.controls
+            )
             if (
                 not self._gui.IsWindow(dialog_window_handle)
                 or not self._gui.IsWindowVisible(dialog_window_handle)
                 or not self._gui.IsWindowEnabled(dialog_window_handle)
-                or not self._gui.GetWindowLong(dialog_window_handle, _GWL_STYLE)
-                & _WS_SYSMENU
+                or not (
+                    wpf_close
+                    or self._gui.GetWindowLong(dialog_window_handle, _GWL_STYLE)
+                    & _WS_SYSMENU
+                )
             ):
                 raise ValueError(
                     "dialog title-bar close action changed before delivery"

@@ -134,9 +134,21 @@ def effective_prepared_text_patch_requests(
             if request.expected_text is not None
             else replace(request, expected_text=target.text)
         )
-        if request.target.kind in {"current", "find"}:
+        if request.target.kind in {"current", "find", "range"}:
+            if request.target.kind == "range":
+                start, end = request.target.start, request.target.end
+                assert start is not None and end is not None
+                if (start.list_id, start.paragraph) != (
+                    target.selection.start.list_id,
+                    target.selection.start.paragraph,
+                ) or (end.list_id, end.paragraph) != (
+                    target.selection.end.list_id,
+                    target.selection.end.paragraph,
+                ):
+                    raise HwpLiveError("prepared range target changed paragraph scope")
             bound = replace(
                 bound,
+                literal_range=None,
                 target=replace(
                     request.target,
                     kind="range",
@@ -149,4 +161,7 @@ def effective_prepared_text_patch_requests(
                 ),
             )
         effective.append(bound)
-    return tuple(effective)
+    result = tuple(effective)
+    if canonical_prepared_text_patch_requests(result) != result:
+        raise HwpLiveError("prepared range targets changed execution order")
+    return result

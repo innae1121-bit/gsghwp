@@ -80,8 +80,12 @@ class TableTopology:
         first_list_id: int,
         second_list_id: int,
     ) -> tuple[str, ...]:
-        first_matches = tuple(cell for cell in self.cells if cell.list_id == first_list_id)
-        second_matches = tuple(cell for cell in self.cells if cell.list_id == second_list_id)
+        first_matches = tuple(
+            cell for cell in self.cells if cell.list_id == first_list_id
+        )
+        second_matches = tuple(
+            cell for cell in self.cells if cell.list_id == second_list_id
+        )
         if len(first_matches) != 1 or len(second_matches) != 1:
             raise HwpLiveError("선택 시작·끝 위치가 대상 표의 실제 셀에 없습니다")
         first, second = first_matches[0], second_matches[0]
@@ -120,7 +124,9 @@ class TableTopology:
             raise HwpLiveError("선택 셀 영역이 빈틈 없는 직사각형이 아닙니다")
         return tuple(
             cell.address
-            for cell in sorted(region, key=lambda item: table_cell_coordinate(item.address))
+            for cell in sorted(
+                region, key=lambda item: table_cell_coordinate(item.address)
+            )
         )
 
     def selection_region_by_addresses(
@@ -128,10 +134,11 @@ class TableTopology:
         addresses: tuple[str, ...],
     ) -> tuple[str, ...]:
         normalized = tuple(dict.fromkeys(address.upper() for address in addresses))
-        selected = tuple(self.by_address.get(address) for address in normalized)
+        selected = tuple(self.selection_owner(address) for address in normalized)
         if not normalized or any(cell is None for cell in selected):
             raise HwpLiveError("선택 주소가 대상 표의 실제 셀에 없습니다")
         physical = tuple(cell for cell in selected if cell is not None)
+        normalized = tuple(dict.fromkeys(cell.address for cell in physical))
         top = min(table_cell_coordinate(cell.address)[0] for cell in physical)
         left = min(table_cell_coordinate(cell.address)[1] for cell in physical)
         bottom = max(
@@ -146,9 +153,11 @@ class TableTopology:
             (
                 cell
                 for cell in self.cells
-                if table_cell_coordinate(cell.address)[0] <= top
+                if table_cell_coordinate(cell.address)[0]
+                <= top
                 < table_cell_coordinate(cell.address)[0] + cell.row_span
-                and table_cell_coordinate(cell.address)[1] <= left
+                and table_cell_coordinate(cell.address)[1]
+                <= left
                 < table_cell_coordinate(cell.address)[1] + cell.column_span
             ),
             None,
@@ -157,9 +166,11 @@ class TableTopology:
             (
                 cell
                 for cell in self.cells
-                if table_cell_coordinate(cell.address)[0] <= bottom
+                if table_cell_coordinate(cell.address)[0]
+                <= bottom
                 < table_cell_coordinate(cell.address)[0] + cell.row_span
-                and table_cell_coordinate(cell.address)[1] <= right
+                and table_cell_coordinate(cell.address)[1]
+                <= right
                 < table_cell_coordinate(cell.address)[1] + cell.column_span
             ),
             None,
@@ -170,6 +181,26 @@ class TableTopology:
         if len(normalized) > 2 and frozenset(normalized) != frozenset(region):
             raise HwpLiveError("선택 주소가 빈틈 없는 직사각형 셀 블록이 아닙니다")
         return region
+
+    def selection_owner(self, address: str) -> NativeDetailedCell | None:
+        """Resolve HWP selection grid corners, including covered merge cells."""
+        direct = self.by_address.get(address.upper())
+        if direct is not None:
+            return direct
+        row, column = table_cell_coordinate(address)
+        return next(
+            (
+                cell
+                for cell in self.cells
+                if table_cell_coordinate(cell.address)[0]
+                <= row
+                < table_cell_coordinate(cell.address)[0] + cell.row_span
+                and table_cell_coordinate(cell.address)[1]
+                <= column
+                < table_cell_coordinate(cell.address)[1] + cell.column_span
+            ),
+            None,
+        )
 
 
 def table_formula_selection_region(
@@ -195,7 +226,9 @@ def table_formula_selection_region(
     except Exception as error:
         raise HwpLiveError("TableFormula 선택 주소를 읽지 못했습니다") from error
     addresses = tuple(
-        dict.fromkeys(match.group(1).upper() for match in _CELL_ADDRESS.finditer(command))
+        dict.fromkeys(
+            match.group(1).upper() for match in _CELL_ADDRESS.finditer(command)
+        )
     )
     if len(addresses) < 2:
         raise HwpLiveError("TableFormula가 다중 셀 선택 주소를 반환하지 않았습니다")
@@ -225,11 +258,7 @@ def table_topology(
     owners: dict[tuple[int, int], str] = {}
     for cell in cells:
         address = cell.address.upper()
-        if (
-            address in by_address
-            or cell.row_span < 1
-            or cell.column_span < 1
-        ):
+        if address in by_address or cell.row_span < 1 or cell.column_span < 1:
             raise HwpLiveError("CellTopology에 중복 주소나 잘못된 span이 있습니다")
         by_address[address] = cell
         row, column = table_cell_coordinate(address)
@@ -308,7 +337,9 @@ def doomed_horizontal_merge_neighbours(
             f"{cell.address}(row_span={cell.row_span},column_span={cell.column_span},"
             f"columns={table_cell_coordinate(cell.address)[1]}.."
             f"{table_cell_coordinate(cell.address)[1] + cell.column_span - 1})"
-            for cell in sorted(spans, key=lambda item: table_cell_coordinate(item.address))
+            for cell in sorted(
+                spans, key=lambda item: table_cell_coordinate(item.address)
+            )
         )
         neighbours.append(f"{neighbour_row}행=[{descriptions}]")
     return neighbours[0], neighbours[1]
@@ -395,9 +426,7 @@ def verify_merge_transition(
     expected_column_span = end_column + end.column_span - start_column
     failures: list[str] = []
     if anchor is None:
-        failures.append(
-            f"owner_at_anchor(expected={anchor_address}, actual=missing)"
-        )
+        failures.append(f"owner_at_anchor(expected={anchor_address}, actual=missing)")
     if after.cell_count != expected_cell_count:
         failures.append(
             f"cell_count(expected={expected_cell_count}, actual={after.cell_count})"

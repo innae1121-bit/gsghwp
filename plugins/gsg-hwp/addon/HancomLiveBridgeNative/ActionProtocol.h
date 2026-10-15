@@ -107,6 +107,8 @@ struct Command {
     bool matchCase = false;
     bool preserveFormat = false;
     bool preflightOnly = false;
+    bool literalRange = false;
+    std::wstring paragraphText;
     double pictureWidthMm = 0.0;
     double pictureHeightMm = 0.0;
     PictureCrop pictureCrop;

@@ -33,7 +33,13 @@ from weakref import ReferenceType, ref
 from pywintypes import com_error
 
 from hwp_checkpoint_signature import checkpoint_signature_is_complete
-from hwp_errors import HwpLiveError
+from hwp_content_signature_refusal_store import (
+    PersistedRefusal,
+    drop_signature_refusals,
+    load_signature_refusal,
+    store_signature_refusal,
+)
+from hwp_errors import HwpLiveError, HwpTextPatchPreflightError
 from hwp_live_native_action_contract import (
     decode_action_result,
     decode_detailed_inspection,
@@ -55,6 +61,7 @@ from hwp_live_native_action_models import (
     NativePosition,
     NativeSelection,
     PreparedTextPatchTarget,
+    TextPatchCommand,
 )
 from hwp_live_native_batch_contract import (
     NATIVE_INSPECT_PAGES_MAX,
@@ -234,6 +241,12 @@ _content_revision_cache: dict[int, str] = {}
 # got smaller. Folding the two together is what made a refusing document pay the
 # full serialisation attempt again after every single write.
 _content_signature_refusals: dict[int, tuple[int, int, int, int]] = {}
+# The windows whose durable refusal this process has already looked at. Adoption
+# is per window and not per process: a worker that later binds a second window
+# has not yet read that window's entry, and must be allowed to. Guarded by
+# ``_content_signature_lock``; ``load_persisted_refusals_once`` is the only place
+# that adds to it.
+_persisted_refusal_windows: set[int] = set()
 _window_freshness_lock = Lock()
 # Engine change events observed per window during this worker's lifetime. The
 # event hook thread bumps these, so writes stay one dictionary assignment.
@@ -551,12 +564,149 @@ def forget_content_signature_refusals(window_handle: int | None = None) -> None:
     Called where the worker stops knowing which document a window holds -- a
     rebind. Ordinary writes deliberately do NOT reach here; that is the whole
     difference between this and ``forget_cached_content_signatures``.
+
+    The durable copy goes with it, so a rebind means the same thing to the next
+    worker as it does to this one. The single exception is a whole-memory clear
+    issued before this process has adopted any durable copy: the first
+    activation of a worker is not a rebind, because there is nothing it has
+    stopped knowing, and a memory this process has never read is not a memory it
+    may invalidate. ``load_persisted_refusals_once`` runs immediately after that
+    clear and is what records the window, so every later clear -- every actual
+    rebind -- drops disk and memory together.
+
+    The rebind caller is ``forget_content_signature_refusals_on_rebind``, which
+    narrows the durable half to the window being rebound; this whole-ledger form
+    stays for the callers that mean the whole ledger.
     """
     with _content_signature_lock:
         if window_handle is None:
             _content_signature_refusals.clear()
-            return
-        _ = _content_signature_refusals.pop(window_handle, None)
+            drop_durable = bool(_persisted_refusal_windows)
+        else:
+            _ = _content_signature_refusals.pop(window_handle, None)
+            drop_durable = True
+    if drop_durable:
+        drop_signature_refusals(window_handle)
+
+
+def forget_content_signature_refusals_on_rebind(window_handle: int) -> None:
+    """A rebind of one window: clear memory, drop **that window's** entry only.
+
+    The memory half is unchanged -- the whole in-process dictionary goes, as it
+    always did on an activation. Forgetting too much in memory only costs this
+    worker a repeated engine attempt on a window it is no longer bound to.
+
+    The durable half is narrowed to the window being rebound. The ledger on disk
+    is shared by every worker on this machine, so the entries in it describe
+    windows of 한/글 instances this process may have nothing to do with -- a
+    second MCP server, a QA harness, a worker that restarted beside this one.
+    Sweeping the whole ledger from here deleted their memory as a side effect of
+    our rebind, and the next thing they did was buy the 17.2s serialisation
+    attempt again. A rebind is a statement about one window; this now says only
+    that.
+
+    The entry is dropped only if this process had adopted it (the window is in
+    ``_persisted_refusal_windows``). A first activation is not a rebind, so it
+    must leave the entry alone for ``load_persisted_refusals_once`` to read.
+    """
+    with _content_signature_lock:
+        _content_signature_refusals.clear()
+        drop_durable = window_handle in _persisted_refusal_windows
+    if drop_durable:
+        drop_signature_refusals(window_handle)
+
+
+def load_persisted_refusals_once(window_handle: int) -> bool:
+    """Adopt a previous worker's refusal for this window, at most once.
+
+    True means this call was the first for this window and the ledger entry was
+    consulted; False means some earlier call already did it and nothing was
+    read. The caller is ``_activate_connection``, right after its rebind clear,
+    passing the window it is activating, so exactly one activation per window
+    pays one file read.
+
+    Only that window's entry is touched -- read, judged, and dropped on a
+    mismatch. Why the ledger may not be walked from here is on
+    ``_adopt_persisted_refusal``.
+
+    A durable entry is adopted only onto the document it was measured on. The
+    entry carries the session tag and the revision token's two hashes; this
+    reads the token once for the activating window and keeps the entry only when
+    all three still match. Anything else -- a different document in that
+    window, 한/글 restarted, an edit since the refusal, a token that cannot be
+    read -- drops the entry from disk and adopts nothing, which leaves the
+    caller exactly where this repair found it: no memory, so the engine is
+    asked, once.
+
+    That gate is the whole correctness argument, and it is not the same one the
+    size rule makes. What the engine gives up on is embedded byte volume
+    (OfficialApiState.cpp :803-805, "HWPML serialisation is proportional to what
+    was embedded" -- an 82MB save signs, a 317MB one does not), and no field of
+    the revision token measures that. Page count, control count and text length
+    do not even correlate with it in the right direction: an image-heavy 317MB
+    document that refuses can carry *fewer* pages, controls and characters than
+    a 3MB text report that signs. So a refusal may never be extrapolated onto a
+    document that is merely no smaller by those three -- doing so answers "this
+    document cannot be signed" about a document the engine would have signed,
+    and hands the caller a wrong notice with it. Within one binding the size
+    rule is still sound, because there the document's identity is what the
+    rebind clear guarantees; across a restart, identity has to be proved, and
+    the hashes are the proof.
+
+    Reading the token is a native call, so it is done under the same best
+    effort as everything else here: a window whose token cannot be read is
+    dropped rather than adopted, and nothing raises out of this function --
+    an activation must not fail because a cache could not be warmed.
+
+    Existing memory wins over the disk. A refusal this process observed itself
+    was measured against the document as it stands now; the durable one only
+    describes what a previous process saw.
+    """
+    with _content_signature_lock:
+        if window_handle in _persisted_refusal_windows:
+            return False
+        _persisted_refusal_windows.add(window_handle)
+    try:
+        persisted = load_signature_refusal(window_handle)
+        if persisted is not None:
+            _adopt_persisted_refusal(window_handle, persisted)
+    except Exception:  # noqa: BLE001 - 캐시 예열이 연결을 깨뜨리면 안 된다
+        return True
+    return True
+
+
+def _adopt_persisted_refusal(window_handle: int, persisted: PersistedRefusal) -> None:
+    """Keep this window's durable entry if its document is still the one in it.
+
+    One window, because the ledger is shared and the dispatch is not owned. The
+    entries on disk are keyed by window handle across every worker on this
+    machine, while ``_batch_for_window`` (:1615) resolves a handle to a process
+    with ``GetWindowThreadProcessId`` and will happily build a dispatch into
+    *any* live 한/글 -- including an instance this process never bound. Judging
+    the whole ledger from one activation therefore sent ``ContentRevision`` (a
+    full control walk plus text extraction, ~6s of frozen UI on a 317MB
+    document) into other people's 한/글, and deleted their entry when the answer
+    did not match ours. The window being activated is the only one this process
+    has anything to say about, so it is the only one judged here; every other
+    entry is judged by the process that services its instance, on its own
+    activation, by this same rule. The rule itself is unchanged, so the answer
+    for any given window is unchanged with it.
+    """
+    measures, identity = persisted
+    try:
+        revision = read_native_content_revision(window_handle)
+    except (HwpLiveError, OSError, ValueError):
+        revision = None
+    if (
+        revision is None
+        or not content_revision_is_complete(revision)
+        or _revision_size_measures(revision)[0] != measures[0]
+        or _revision_content_identity(revision) != identity
+    ):
+        drop_signature_refusals(window_handle)
+        return
+    with _content_signature_lock:
+        _ = _content_signature_refusals.setdefault(window_handle, measures)
 
 
 def _revision_size_measures(revision: str) -> tuple[int, int, int, int]:
@@ -569,6 +719,19 @@ def _revision_size_measures(revision: str) -> tuple[int, int, int, int]:
     return int(parts[6]), int(parts[1]), int(parts[2]), int(parts[5])
 
 
+def _revision_content_identity(revision: str) -> tuple[int, int]:
+    """(control hash, text hash) out of a `REV` -- which document this is.
+
+    The two fields ``_revision_size_measures`` throws away. Sizes bound how big
+    a document is; these two say *which* document it is, which is what a
+    remembered refusal has to be pinned to before it may be reused across a
+    worker restart. Same field order as ``content_revision_is_complete``, and
+    the same precondition: only complete tokens reach here.
+    """
+    parts = _C_WHITESPACE.split(revision.strip(_C_WHITESPACE_CHARACTERS))
+    return int(parts[3]), int(parts[4])
+
+
 def _remember_signature_refusal(window_handle: int, revision: str | None) -> None:
     """Record how big the document was when the engine refused it.
 
@@ -576,12 +739,24 @@ def _remember_signature_refusal(window_handle: int, revision: str | None) -> Non
     document against, so nothing is remembered and the next caller pays the
     engine again. That is the honest outcome: a refusal this code cannot
     describe is a refusal it must not extrapolate from.
+
+    The same measures go to disk so the next worker starts where this one
+    ended, and the token's two hashes go with them: the durable copy may only
+    be reused on the document it was measured on, and those hashes are what
+    says so (``load_persisted_refusals_once``). Remembering is best effort in
+    both places: the store swallows its own I/O failures and answers False, and
+    a False here costs one repeated serialisation attempt after a restart --
+    never this edit.
     """
     if revision is None or not content_revision_is_complete(revision):
         forget_content_signature_refusals(window_handle)
         return
+    measures = _revision_size_measures(revision)
     with _content_signature_lock:
-        _content_signature_refusals[window_handle] = _revision_size_measures(revision)
+        _content_signature_refusals[window_handle] = measures
+    _ = store_signature_refusal(
+        window_handle, measures, _revision_content_identity(revision)
+    )
 
 
 def _engine_still_refuses(window_handle: int) -> bool:
@@ -653,6 +828,30 @@ def engine_refuses_content_signature(window_handle: int) -> bool:
         return _engine_still_refuses(window_handle)
     except (HwpLiveError, OSError, ValueError):
         return False
+
+
+def remembered_content_signature_refusal(
+    window_handle: int,
+) -> tuple[int, int, int, int] | None:
+    """The refusal this worker already holds for a window, without any I/O.
+
+    One dictionary lookup under the lock every other reader takes, and nothing
+    else -- no revision token, no ``ContentSignature``, no disk. That is the
+    whole reason it exists next to ``engine_refuses_content_signature``, which
+    answers a related question but cannot answer it for free: on a cache miss
+    that function falls into ``_engine_still_refuses`` (:761), which reads
+    ``ContentRevision`` -- a native call measured at about 6s on a 317MB
+    document. A caller that already carries its own, cheaper proof that a
+    remembered refusal still describes the document needs the memory itself,
+    not a re-derivation of it.
+
+    ``None`` means nothing is remembered, never "the engine would sign this".
+    The tuple is exactly what ``_remember_signature_refusal`` (:734) stored, in
+    the order ``_revision_size_measures`` (:711) produces it: session tag, page
+    count, control count, text length.
+    """
+    with _content_signature_lock:
+        return _content_signature_refusals.get(window_handle)
 
 
 def remember_content_signature_refusal(window_handle: int) -> None:
@@ -1144,6 +1343,8 @@ class _BatchDispatch(Protocol):
     ) -> str: ...
 
     def PrepareTextPatches(self, payload: str) -> str: ...
+
+    def PrepareLiteralTextPatches(self, payload: str) -> str: ...
 
     def ExecutePreparedTextPatches(
         self,
@@ -3183,10 +3384,25 @@ def preflight_native_text_patches(
         batch = _batch_for_window(window_handle, 14, *modules)
         if batch is None:
             return None
+        literal = any(
+            isinstance(command, TextPatchCommand) and command.literal_range is not None
+            for command in request.commands
+        )
         try:
-            response = str(batch.PrepareTextPatches(encode_action_request(request)))
+            if literal:
+                response = str(
+                    batch.PrepareLiteralTextPatches(encode_action_request(request))
+                )
+            else:
+                response = str(batch.PrepareTextPatches(encode_action_request(request)))
         except AttributeError:
             _invalidate_native_dispatch(window_handle)
+            if literal:
+                raise HwpLiveError(
+                    "현재 한컴 브리지는 원문 좌표 준비 기능이 없습니다. 문서를 저장한 뒤 한컴을 다시 열어 새 브리지를 로드하세요.",
+                    mutation_started=False,
+                    safe_to_repeat=True,
+                ) from None
             return None
         except (OSError, RuntimeError, TypeError, ValueError, com_error) as error:
             _raise_native_call_error(
@@ -3207,8 +3423,11 @@ def preflight_native_text_patches(
         # assumed of a bridge that did not answer.
         safe_to_repeat = fields[6] != "0" if len(fields) == 8 else True
         mutation_started = fields[7] == "1" if len(fields) == 8 else False
-        raise HwpLiveError(
-            f"text.patch preflight patches[{index}] {code}: {message}",
+        raise HwpTextPatchPreflightError(
+            index,
+            code,
+            b64decode(fields[4], validate=True).decode("utf-8"),
+            message,
             mutation_started=mutation_started,
             safe_to_repeat=safe_to_repeat,
         )

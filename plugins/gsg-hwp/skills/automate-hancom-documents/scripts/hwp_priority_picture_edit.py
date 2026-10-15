@@ -360,12 +360,20 @@ def _execute_picture_transfer(
     copied: bool,
 ) -> tuple[int, int, int, int, bool, object]:
     """첫 Copy 거부 때만 새로 선택한 뒤 같은 한 장을 한 번 더 시도한다."""
+    if not copied:
+        return _execute(request.candidate, commands)
     try:
-        return _execute(request.candidate, commands)
+        copied_result = _execute(request.candidate, commands[:3])
     except HwpLiveError as error:
-        if not copied or not _copy_action_failed(error):
+        if not _copy_action_failed(error):
             raise
-        return _execute(request.candidate, commands)
+        copied_result = _execute(request.candidate, commands[:3])
+    pasted_result = _execute(request.candidate, commands[3:])
+    return (
+        copied_result[0] + pasted_result[0],
+        copied_result[1] + pasted_result[1],
+        *pasted_result[2:],
+    )
 
 
 def _geometry(
@@ -404,11 +412,17 @@ def _document_pages(
     first_page: NativePageInspection,
     cache: dict[int, NativePageInspection],
 ) -> Iterator[NativePageInspection]:
-    """힌트 쪽을 먼저 내고, 같은 검사를 되풀이하지 않으며 문서 전체를 돈다."""
+    """힌트와 가까운 쪽부터 찾고, 같은 검사를 되풀이하지 않는다."""
     yield first_page
-    for page_number in range(1, first_page.page_count + 1):
-        if page_number == first_page.page:
-            continue
+    pages = sorted(
+        (
+            page
+            for page in range(1, first_page.page_count + 1)
+            if page != first_page.page
+        ),
+        key=lambda page: (abs(page - first_page.page), page < first_page.page),
+    )
+    for page_number in pages:
         page = cache.get(page_number)
         if page is None:
             page = _inspect(request, page_number)

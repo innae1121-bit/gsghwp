@@ -4,10 +4,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -753,7 +755,6 @@ bool SelectCellTextPatchMatch(
     Selection cellSelection;
     std::wstring cellText;
     if (!GetSelection(context->hwp, &cellSelection, context->result) ||
-        !cellSelection.selected ||
         cellSelection.start.list != cellSelection.end.list ||
         !ReadSelectedText(context, &cellText, location)) {
         return SetError(
@@ -761,6 +762,21 @@ bool SelectCellTextPatchMatch(
             L"TEXT_FIND_STATE",
             location,
             L"table cell did not expose one text selection");
+    }
+    if (cellText.empty()) {
+        if ((command.hasExpectedText && !command.first.empty()) ||
+            command.occurrence > 1) {
+            return SetError(context->result, L"STALE_CELL_TEXT", location,
+                            L"empty target cell does not match expected text");
+        }
+        Position cursor;
+        return GetPosition(context->hwp, &cursor, context->result) &&
+            SetPosition(context->hwp, cursor, context->result, location);
+    }
+    if (!cellSelection.selected ||
+        (command.hasExpectedText && command.first.empty())) {
+        return SetError(context->result, L"STALE_CELL_TEXT", location,
+                        L"expected an empty cell but target contains text");
     }
     if (!command.hasExpectedText) {
         return true;
@@ -823,292 +839,311 @@ bool SelectCellTextPatchMatch(
         location);
 }
 
-bool PrepareForwardFind(
-    Context* const context,
-    const std::wstring& expected,
-    const bool matchCase,
-    CComPtr<IDispatch>& set) {
-    CComPtr<IDispatch> parameterSets;
-    CComPtr<IDispatch> findReplace;
-    if (!GetDispatchProperty(
-            context->hwp,
-            L"HParameterSet",
-            parameterSets,
-            context->result,
-            L"text.find") ||
-        !GetDispatchProperty(
-            parameterSets,
-            L"HFindReplace",
-            findReplace,
-            context->result,
-            L"text.find") ||
-        !GetDispatchProperty(
-            findReplace,
-            L"HSet",
-            set,
-            context->result,
-            L"text.find")) {
-        return false;
-    }
-    CComVariant ignored;
-    const HRESULT status = Method(
-        context->action,
-        L"GetDefault",
-        {CComVariant(L"ForwardFind"), CComVariant(set)},
-        &ignored);
-    if (FAILED(status)) {
-        return SetError(
-            context->result,
-            L"ACTION_DEFAULT",
-            L"text.find",
-            FormatHResult(L"ForwardFind", status));
-    }
-    return PutItemOrProperty(
-               findReplace,
-               L"FindString",
-               CComVariant(expected.c_str()),
-               context->result,
-               L"text.find") &&
-        PutItemOrProperty(
-               findReplace,
-               L"Direction",
-               CComVariant(0L),
-               context->result,
-               L"text.find") &&
-        PutItemOrProperty(
-               findReplace,
-               L"MatchCase",
-               BooleanVariant(matchCase),
-               context->result,
-               L"text.find") &&
-        PutItemOrProperty(
-               findReplace,
-               L"IgnoreMessage",
-               BooleanVariant(true),
-               context->result,
-               L"text.find");
-}
-
-// ForwardFind answers with the coordinates it matched at, and the replacement
-// deletes whatever those coordinates span. The block readback is not the same
-// measure: an automatically numbered paragraph draws its number in front of
-// every readback taken inside it while occupying no character cell, so the
-// readback is routinely wider than the span and can never say what a deletion
-// would destroy. Only the span can. A span that is already the literal is left
-// untouched -- that is the ordinary match, numbered paragraphs included, and it
-// costs no call. A wider span is pulled back onto the literal so the surplus
-// survives, and a wider span that cannot be mapped back onto the readback fails
-// closed, because a surplus that cannot be located is a surplus that must not
-// be deleted.
-bool NarrowForwardFindSelection(
+bool SelectVerifiedScannedText(
     Context* const context,
     const Command& command,
-    Selection* const selection) {
-    const auto stale = [context](const wchar_t* const message) {
-        return SetError(
-            context->result, L"STALE_SELECTION_TEXT", L"text.find", message);
+    const Selection& candidate) {
+    const std::wstring location = L"text.find";
+    const auto stale = [context, &location](const wchar_t* message) {
+        return SetError(context->result, L"STALE_SELECTION_TEXT", location, message);
     };
-    if (selection == nullptr || command.first.empty() ||
-        selection->start.list != selection->end.list ||
-        selection->start.paragraph != selection->end.paragraph ||
-        selection->end.character < selection->start.character) {
-        return stale(
-            L"ForwardFind did not select one paragraph range of text");
+    std::wstring readback;
+    const bool selected = SelectTextRange(
+        context, candidate.start, candidate.end, location);
+    if (!selected && context->result->error.code != L"TEXT_RANGE") {
+        return false;
     }
-    const size_t span = static_cast<size_t>(
-        selection->end.character - selection->start.character);
-    if (span == command.first.size()) {
+    if (selected && !ReadSelectedText(context, &readback, location)) {
+        return false;
+    }
+    if (selected && MatchesExpectedReadback(readback, command.first,
+            command.matchCase, ReadbackPolicy::Exact)) {
         return true;
     }
-    if (span < command.first.size()) {
-        return stale(
-            L"ForwardFind selected fewer characters than the requested text");
+    std::wstring automaticNumber = selected ? ReadAutomaticNumber(context) : L"";
+    if (selected && MatchesExpectedReadback(readback, command.first,
+            automaticNumber, command.matchCase, ReadbackPolicy::Exact)) {
+        return true;
     }
-    std::wstring readback;
-    if (!ReadSelectedText(context, &readback, L"text.find")) {
+    context->result->error = {};
+    // A scan offset is a hint. Recover inside this exact paragraph, never by
+    // rescanning the document or choosing a different repeated occurrence.
+    const Position begin{candidate.start.list, candidate.start.paragraph, 0};
+    Position end;
+    if (!SetPosition(context->hwp, begin, context->result, location) ||
+        !RunVerifiedNavigationAction(context->action, L"MoveParaEnd", context->result, location) ||
+        !GetPosition(context->hwp, &end, context->result)) {
         return false;
     }
-    // One character per cell holds only once the paragraph's drawn number --
-    // the single prefix known to carry no cells -- is off the front. If the two
-    // still disagree after that, the surplus cannot be placed and the range
-    // cannot be narrowed onto the literal.
-    const std::wstring automaticNumber = ReadAutomaticNumber(context);
-    const std::wstring prefix =
-        automaticNumber.empty() ? std::wstring() : automaticNumber + L' ';
-    std::wstring body = readback;
-    if (!prefix.empty() && body.size() > prefix.size() &&
-        body.compare(0, prefix.size(), prefix) == 0) {
-        body = body.substr(prefix.size());
+    if (end.list != begin.list || end.paragraph != begin.paragraph || end.character <= 0) {
+        return stale(L"could not read the original paragraph for coordinate recovery");
     }
-    if (body.size() != span ||
-        body.find_first_of(L"\r\n") != std::wstring::npos ||
-        command.first.find_first_of(L"\r\n") != std::wstring::npos) {
-        return stale(
-            L"ForwardFind selected more than the requested text and the "
-            L"surplus could not be located");
-    }
-    size_t matchOffset = 0;
-    size_t matchCount = 0;
-    for (size_t offset = 0; offset + command.first.size() <= body.size();
-         ++offset) {
-        if (TextMatchesAt(body, command.first, offset, command.matchCase)) {
-            matchOffset = offset;
-            if (++matchCount > 1) {
-                return stale(
-                    L"ForwardFind selected more than the requested text, which "
-                    L"the surplus repeats");
-            }
+    automaticNumber = ReadAutomaticNumber(context);
+    const auto read = [&](const Position& first, const Position& last, std::wstring* text) {
+        if (!SelectTextRange(context, first, last, location) ||
+            !ReadSelectedText(context, text, location)) {
+            return false;
         }
+        const std::wstring prefix = automaticNumber.empty() ? L"" : automaticNumber + L' ';
+        if (!prefix.empty() && text->compare(0, prefix.size(), prefix) == 0) {
+            text->erase(0, prefix.size());
+        }
+        return true;
+    };
+    std::wstring paragraph;
+    if (!read(begin, end, &paragraph)) { return false; }
+    if (paragraph.size() > static_cast<size_t>(end.character) ||
+        paragraph.find_first_of(L"\r\n") != std::wstring::npos) {
+        return stale(L"coordinate recovery did not expose one paragraph");
     }
-    if (matchCount != 1) {
-        return stale(
-            L"ForwardFind selected a range that does not hold the requested "
-            L"text once");
+    std::wstring folded = paragraph;
+    std::wstring needle = command.first;
+    if (!command.matchCase) {
+        const auto lower = [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); };
+        std::transform(folded.begin(), folded.end(), folded.begin(), lower);
+        std::transform(needle.begin(), needle.end(), needle.begin(), lower);
     }
-    const Position literalStart{
-        selection->start.list,
-        selection->start.paragraph,
-        selection->start.character + static_cast<LONG>(matchOffset)};
-    const Position literalEnd{
-        literalStart.list,
-        literalStart.paragraph,
-        literalStart.character + static_cast<LONG>(command.first.size())};
-    Selection confirmed;
-    if (!SelectTextRange(context, literalStart, literalEnd, L"text.find") ||
-        !GetSelection(context->hwp, &confirmed, context->result)) {
-        return false;
+    const size_t offset = folded.find(needle);
+    if (offset == std::wstring::npos || folded.find(needle, offset + 1) != std::wstring::npos) {
+        return stale(L"coordinate recovery requires one literal in the original paragraph");
     }
-    if (!confirmed.selected || !SamePosition(confirmed.start, literalStart) ||
-        !SamePosition(confirmed.end, literalEnd)) {
-        return stale(L"the range narrowed onto the requested text did not hold");
+    LONG character = static_cast<LONG>(offset);
+    if (paragraph.size() != static_cast<size_t>(end.character)) {
+        // Hidden controls can occupy native cells without contributing visible
+        // text. Locate the visible prefix boundary in O(log paragraph length)
+        // native reads instead of probing every nearby coordinate over IPC.
+        LONG low = 0;
+        LONG high = end.character;
+        while (low < high) {
+            const LONG middle = low + (high - low) / 2 + 1;
+            std::wstring prefix;
+            if (!read(begin, Position{begin.list, begin.paragraph, middle}, &prefix)) {
+                return false;
+            }
+            if (paragraph.compare(0, prefix.size(), prefix) != 0) {
+                return stale(L"paragraph changed while recovering its coordinate");
+            }
+            if (prefix.size() <= offset) { low = middle; }
+            else { high = middle - 1; }
+        }
+        character = low;
     }
-    *selection = confirmed;
+    if (command.first.size() > static_cast<size_t>(end.character - character)) {
+        return stale(L"recovered literal exceeds its paragraph");
+    }
+    const Position from{begin.list, begin.paragraph, character};
+    const Position to{begin.list, begin.paragraph,
+        character + static_cast<LONG>(command.first.size())};
+    if (!read(from, to, &readback)) { return false; }
+    if (!MatchesExpectedReadback(readback, command.first, command.matchCase, ReadbackPolicy::Exact)) {
+        return stale(L"recovered range does not contain the exact requested literal");
+    }
     return true;
 }
+
+// GetText/MovePos(201) expose native scan positions without invoking a find
+// action or inheriting the user's last regex/whole-word/search-dialog settings.
+class TextPatchScan final {
+public:
+    TextPatchScan(IDispatch* const hwp, const bool acquired, HRESULT* const releaseStatus)
+        : hwp_(hwp), acquired_(acquired), releaseStatus_(releaseStatus) {}
+    ~TextPatchScan() { Close(); }
+    HRESULT Close() {
+        if (!acquired_) {
+            return *releaseStatus_;
+        }
+        acquired_ = false;
+        *releaseStatus_ = Method(hwp_, L"ReleaseScan", {}, nullptr);
+        return *releaseStatus_;
+    }
+private:
+    IDispatch* hwp_;
+    bool acquired_;
+    HRESULT* releaseStatus_;
+};
 
 bool SelectTextPatchMatch(
     Context* const context,
     const Command& command,
     const Selection& original,
     const LONG listFilter) {
-    constexpr size_t kMaximumCandidates = 24;
     constexpr size_t kMaximumSearches = 20'000;
-    CComPtr<IDispatch> findSet;
-    if (!PrepareForwardFind(context, command.first, command.matchCase, findSet)) {
-        return false;
+    constexpr size_t kMaximumScanCharacters = 16 * 1024 * 1024;
+    const auto fail = [context](const wchar_t* code, const wchar_t* message) {
+        return SetError(context->result, code, L"text.find", message);
+    };
+    if (command.first.empty() ||
+        command.first.find_first_of(L"\r\n") != std::wstring::npos) {
+        return fail(L"TEXT_FIND_STATE",
+            L"text lookup requires one paragraph literal; use an exact range "
+            L"or table cell target for multiple paragraphs");
     }
-    const bool positioned = listFilter < 0
-        ? RunVerifiedNavigationAction(
-              context->action,
-              L"MoveDocBegin",
-              context->result,
-              L"text.find")
-        : SetPosition(
-              context->hwp,
-              Position{listFilter, 0, 0},
-              context->result,
-              L"text.find");
-    if (!positioned) {
-        return false;
-    }
-    std::set<std::wstring> seen;
     std::vector<TextMatch> matches;
     bool exhausted = false;
-    for (size_t search = 0; search < kMaximumSearches; ++search) {
-        bool found = false;
-        if (!CallBooleanMethod(
-                context->action,
-                L"Execute",
-                {CComVariant(L"ForwardFind"), CComVariant(findSet)},
-                &found,
-                context->result,
-                L"text.find")) {
+    bool occurrenceFound = false;
+    HRESULT releaseStatus = S_OK;
+    const bool scanned = [&]() {
+        if (!SetPosition(context->hwp,
+                Position{listFilter < 0 ? 0 : listFilter, 0, 0},
+                context->result, L"text.find")) {
             return false;
         }
-        if (!found) {
-            exhausted = true;
-            break;
+        CComVariant raw;
+        // A scoped cell stays in its list. Document lookup includes sublists
+        // and control boundaries; text is never joined across those boundaries.
+        const HRESULT initialized = Method(context->hwp, L"InitScan",
+            {CComVariant(listFilter < 0 ? 0x0FL : 0L),
+             CComVariant(listFilter < 0 ? 0x0077L : 0x0055L),
+             CComVariant(0L), CComVariant(0L), CComVariant(0L), CComVariant(0L)},
+            &raw);
+        TextPatchScan scan(context->hwp, SUCCEEDED(initialized), &releaseStatus);
+        bool started = false;
+        if (FAILED(initialized) || FAILED(AsBool(raw, &started)) || !started) {
+            return fail(L"TEXT_SCAN_STATE", L"native text scan could not start");
         }
-        Selection current;
-        if (!GetSelection(context->hwp, &current, context->result) ||
-            !current.selected || current.start.list != current.end.list) {
-            return SetError(
-                context->result,
-                L"TEXT_FIND_STATE",
-                L"text.find",
-                L"ForwardFind did not return one text selection");
+        // Linear literal matching, including a literal split across contiguous
+        // scan chunks. Repeated prefixes in a long paragraph must not cause
+        // quadratic comparisons or a separate document scan per occurrence.
+        std::wstring needle = command.first;
+        if (!command.matchCase) {
+            std::transform(needle.begin(), needle.end(), needle.begin(),
+                [](const wchar_t character) { return static_cast<wchar_t>(towlower(character)); });
         }
-        const std::wstring key = TextMatchKey(current);
-        if (!seen.insert(key).second) {
-            exhausted = true;
-            break;
-        }
-        if (!NarrowForwardFindSelection(context, command, &current)) {
-            return false;
-        }
-        if (listFilter < 0 || current.start.list == listFilter) {
-            matches.push_back(TextMatch{current});
-            if (command.occurrence > 0 &&
-                matches.size() == static_cast<size_t>(command.occurrence)) {
-                return true;
+        std::vector<size_t> prefix(needle.size(), 0);
+        for (size_t index = 1, matched = 0; index < needle.size(); ++index) {
+            while (matched > 0 && needle[index] != needle[matched]) {
+                matched = prefix[matched - 1];
             }
-            if (command.occurrence == 0 && matches.size() == kMaximumCandidates) {
+            if (needle[index] == needle[matched]) { ++matched; }
+            prefix[index] = matched;
+        }
+        size_t matched = 0;
+        Position previousEnd{-1, -1, -1};
+        size_t characters = 0;
+        size_t occurrences = 0;
+        std::set<std::wstring> seen;
+        for (size_t step = 0; step < kMaximumSearches; ++step) {
+            CComBSTR chunk;
+            CComVariant argument;
+            argument.vt = VT_BSTR | VT_BYREF;
+            argument.pbstrVal = &chunk.m_str;
+            LONG state = 0;
+            if (FAILED(Method(context->hwp, L"GetText", {argument}, &raw)) ||
+                FAILED(AsLong(raw, &state)) || state < 0 || state > 5) {
+                return fail(L"TEXT_SCAN_STATE", L"native text scan failed before mutation");
+            }
+            const size_t length = chunk.Length();
+            if (length > kMaximumScanCharacters - characters) {
+                return fail(L"TEXT_SEARCH_LIMIT", L"native text scan exceeded its character budget");
+            }
+            characters += length;
+            if (length != 0) {
+                bool moved = false;
+                Position start;
+                if (!CallBooleanMethod(context->hwp, L"MovePos",
+                        {CComVariant(201L), CComVariant(0L), CComVariant(0L)},
+                        &moved, context->result, L"text.find") || !moved ||
+                    !GetPosition(context->hwp, &start, context->result)) {
+                    return fail(L"TEXT_SCAN_STATE", L"native scan position is unavailable");
+                }
+                if (listFilter >= 0 && start.list != listFilter) {
+                    return fail(L"TEXT_SCAN_STATE", L"native scan left the requested cell list");
+                }
+                std::wstring_view text(chunk.m_str, length);
+                while (!text.empty() && (text.back() == L'\r' || text.back() == L'\n')) {
+                    text.remove_suffix(1);
+                }
+                if (start.character < 0 || text.size() > static_cast<size_t>(
+                        (std::numeric_limits<LONG>::max)() - start.character)) {
+                    return fail(L"TEXT_SCAN_STATE", L"native scan position exceeds the text range limit");
+                }
+                // Only contiguous chunks of the SAME native paragraph can
+                // contribute to one literal, never text across a control.
+                if (!SamePosition(previousEnd, start) || state == 4 || state == 5) {
+                    matched = 0;
+                }
+                previousEnd = Position{start.list, start.paragraph,
+                    start.character + static_cast<LONG>(text.size())};
+                for (size_t offset = 0; offset < text.size(); ++offset) {
+                    const wchar_t character = command.matchCase ? text[offset] :
+                        static_cast<wchar_t>(towlower(text[offset]));
+                    while (matched > 0 && character != needle[matched]) {
+                        matched = prefix[matched - 1];
+                    }
+                    if (character == needle[matched]) { ++matched; }
+                    if (matched != needle.size()) {
+                        continue;
+                    }
+                    const Position to{start.list, start.paragraph,
+                        start.character + static_cast<LONG>(offset + 1)};
+                    const Position from{to.list, to.paragraph,
+                        to.character - static_cast<LONG>(needle.size())};
+                    const Selection selection{true, kSelectionText, from, to};
+                    matched = 0; // Preserve non-overlapping occurrence semantics.
+                    if (seen.insert(TextMatchKey(selection)).second) {
+                        ++occurrences;
+                        if (command.occurrence == 0 ||
+                            occurrences == static_cast<size_t>(command.occurrence)) {
+                            matches.push_back(TextMatch{selection});
+                        }
+                        occurrenceFound = command.occurrence > 0 &&
+                            occurrences == static_cast<size_t>(command.occurrence);
+                        if (occurrenceFound || matches.size() == 2) {
+                            break;
+                        }
+                    }
+                }
+                if (state != 2 || text.size() != length) {
+                    matched = 0;
+                }
+            } else {
+                matched = 0;
+            }
+            // State 0 means no text, not end of document (e.g. empty controls).
+            exhausted = state == 1;
+            if (exhausted || occurrenceFound || matches.size() == 2) {
                 break;
             }
         }
-        if (!SetPosition(
-                context->hwp,
-                current.end,
-                context->result,
-                L"text.find")) {
-            return false;
+        if (FAILED(scan.Close())) {
+            return fail(L"TEXT_SCAN_STATE", L"native text scan could not be released");
         }
+        return true;
+    }();
+    if (FAILED(releaseStatus)) {
+        context->result->retrySafe = false;
+        fail(L"TEXT_SCAN_STATE", L"native text scan could not be released");
     }
-    if (command.occurrence > 0) {
+    if (!scanned || FAILED(releaseStatus) ||
+        (!occurrenceFound && (matches.size() != 1 || !exhausted))) {
         if (!RestoreTextPosition(context, original, L"text.find.restore")) {
+            context->result->retrySafe = false;
             return false;
         }
-        return SetError(
-            context->result,
-            exhausted ? L"TEXT_OCCURRENCE_NOT_FOUND" : L"TEXT_SEARCH_LIMIT",
-            L"text.find",
-            L"requested text occurrence was not found before mutation");
-    }
-    if (!exhausted && matches.size() < 2) {
-        if (!RestoreTextPosition(context, original, L"text.find.restore")) {
+        if (!scanned || FAILED(releaseStatus)) {
             return false;
         }
-        return SetError(
-            context->result,
-            L"TEXT_SEARCH_LIMIT",
-            L"text.find",
-            L"text search limit was reached before uniqueness could be proven");
-    }
-    if (matches.empty()) {
-        if (!RestoreTextPosition(context, original, L"text.find.restore")) {
-            return false;
+        if (matches.size() > 1) {
+            return SetError(context->result, L"AMBIGUOUS_TEXT_MATCH",
+                TextMatchCandidates(matches),
+                L"multiple text matches require an explicit range, cell, or occurrence");
         }
-        return SetError(
-            context->result,
-            exhausted ? L"TEXT_NOT_FOUND" : L"TEXT_SEARCH_LIMIT",
-            L"text.find",
-            L"text.patch found no matching text before mutation");
+        return fail(!exhausted ? L"TEXT_SEARCH_LIMIT" :
+                command.occurrence > 0 ? L"TEXT_OCCURRENCE_NOT_FOUND" : L"TEXT_NOT_FOUND",
+            L"native text lookup did not resolve a unique target before mutation");
     }
-    if (matches.size() > 1) {
-        if (!RestoreTextPosition(context, original, L"text.find.restore")) {
-            return false;
-        }
-        return SetError(
-            context->result,
-            L"AMBIGUOUS_TEXT_MATCH",
-            TextMatchCandidates(matches),
-            L"multiple text matches require an explicit occurrence");
+    // Scanning never mutates or selects text. Release it before selecting the
+    // exact literal span; PatchSelectedText / preflight still verify readback.
+    if (SelectVerifiedScannedText(context, command, matches.front().selection)) {
+        return true;
     }
-    return SelectTextRange(
-        context,
-        matches.front().selection.start,
-        matches.front().selection.end,
-        L"text.find");
+    const Error error = context->result->error;
+    if (!RestoreTextPosition(context, original, L"text.find.restore")) {
+        context->result->retrySafe = false;
+        return false;
+    }
+    context->result->error = error;
+    return false;
 }
 
 bool PatchSearchedText(
@@ -1133,12 +1168,10 @@ bool PatchSearchedText(
             command.second,
             location,
             command.preserveFormat,
-            ReadbackPolicy::Find);
+            ReadbackPolicy::Exact);
 }
 
 using ShadowCellKey = std::pair<std::wstring, std::wstring>;
-
-static thread_local const Request* reusableTableTextFillRequest = nullptr;
 
 bool SelectTableForCellPatch(
     Context* const context,
@@ -1147,17 +1180,10 @@ bool SelectTableForCellPatch(
     if (!SelectControl(context, tableId, selectedControl)) {
         return false;
     }
-    // SelectControl already read the freshly selected control's instance id
-    // and refused anything but tableId, so the selection is proven to be the
-    // requested table. Asking on top of that whether it is the *same dispatch
-    // wrapper* we cached is a question HWP always answers no to: every
-    // CurSelectedCtrl read hands back a new wrapper. That never-true term made
-    // each cell of a fill batch fall into CaptureCurrentTable, whose
-    // topology.Clear made the next GoToCell re-inspect every cell of the
-    // table -- an O(commands x table cells) walk before a single character was
-    // written.
+    // SelectControl verifies the live instance id; GoToCell still verifies the
+    // cached list's parent and address. COM wrapper identity is not stable.
     const bool safeToReuse =
-        context->request == reusableTableTextFillRequest &&
+        context->reuseTextPatchTopology &&
         context->table != nullptr &&
         context->tableId == tableId;
     if (safeToReuse) {
@@ -1237,8 +1263,17 @@ bool PatchText(Context* const context, const Command& command) {
             return false;
         }
         const std::wstring address = NormalizeAddress(command.cellAddress);
+        if (!SelectCellTextPatchMatch(context, command, original, address)) {
+            return false;
+        }
+        Selection cellSelection;
+        if (!GetSelection(context->hwp, &cellSelection, context->result)) {
+            return false;
+        }
+        if (!cellSelection.selected) {
+            return PatchCurrentText(context, command);
+        }
         return
-            SelectCellTextPatchMatch(context, command, original, address) &&
             PatchSelectedText(
                 context,
                 command.first,
@@ -1261,6 +1296,25 @@ enum class TableTextBatchKind {
     Fill,
     Expand,
 };
+
+bool IsTextPatchFormatBatch(const Request& request) {
+    bool hasTextPatch = false;
+    for (const Command& command : request.commands) {
+        if (command.kind == CommandKind::TextPatch) {
+            hasTextPatch = true;
+            continue;
+        }
+        if (command.kind == CommandKind::Action &&
+            ((command.name == L"CharShape" &&
+              command.parameterSet == L"HCharShape") ||
+             (command.name == L"ParagraphShape" &&
+              command.parameterSet == L"HParaShape"))) {
+            continue;
+        }
+        return false;
+    }
+    return hasTextPatch;
+}
 
 TableTextBatchKind ClassifyTableTextBatch(const Request& request) {
     if (request.commands.size() < 3 ||
@@ -1375,11 +1429,15 @@ bool ApplyShadowPatch(
             L"text occurrence must be between 1 and 20000 when supplied");
     }
     if (command.first.empty()) {
+        if (command.name == L"CELL" && value->empty() && command.occurrence <= 1) {
+            *value = command.second;
+            return true;
+        }
         return SetError(
             result,
-            L"TEXT_PATCH_EXPECTED",
+            L"STALE_CELL_TEXT",
             address,
-            L"table cell text.patch requires non-empty expected text");
+            L"empty expected text requires an empty target cell");
     }
     std::vector<size_t> matches;
     for (size_t offset = 0;
@@ -1433,13 +1491,13 @@ bool ApplyShadowPatch(
 bool PreflightTableTextCommands(
     Context* const context,
     const Request& request) {
-    reusableTableTextFillRequest = nullptr;
+    context->reuseTextPatchTopology = false;
     if (!ValidateCellTextPatchLimit(context->result, request)) {
         return false;
     }
     const TableTextBatchKind batchKind = ClassifyTableTextBatch(request);
-    reusableTableTextFillRequest =
-        batchKind == TableTextBatchKind::Fill ? &request : nullptr;
+    context->reuseTextPatchTopology =
+        batchKind == TableTextBatchKind::Fill || IsTextPatchFormatBatch(request);
     if (batchKind == TableTextBatchKind::None) {
         return true;
     }
@@ -1588,11 +1646,144 @@ bool VerifyPreflightSelection(
              L"selected text changed before text.patch preflight"));
 }
 
+struct LiteralParagraph {
+    Position end;
+    std::wstring text;
+    std::wstring automaticNumber;
+    std::map<LONG, size_t> prefixLengths;
+    std::map<std::pair<LONG, bool>, LONG> boundaries;
+};
+
+using LiteralParagraphs = std::map<std::pair<LONG, LONG>, LiteralParagraph>;
+
+// Inspected text offsets are not HWP cursor positions. Resolve both boundaries
+// inside the observed paragraph, before any mutation, and share reads between
+// targets. No guessed coordinates, document searches, or IPC retry loop.
+bool SelectInspectedLiteral(
+    Context* const context, const Command& command, LiteralParagraphs* const cache) {
+    const std::wstring location = L"text.patch.literal_range";
+    const auto stale = [&](const wchar_t* message) {
+        return SetError(context->result, L"STALE_SELECTION_TEXT", location, message);
+    };
+    const Position begin{command.list, command.paragraph, 0};
+    const auto key = std::make_pair(begin.list, begin.paragraph);
+    auto entry = cache->find(key);
+    if (entry == cache->end()) {
+        LiteralParagraph paragraph;
+        if (!SetPosition(context->hwp, begin, context->result, location) ||
+            !RunVerifiedNavigationAction(context->action, L"MoveParaEnd", context->result, location) ||
+            !GetPosition(context->hwp, &paragraph.end, context->result)) {
+            return false;
+        }
+        if (paragraph.end.list != begin.list || paragraph.end.paragraph != begin.paragraph ||
+            paragraph.end.character <= 0) {
+            return stale(L"native paragraph extent is unavailable");
+        }
+        paragraph.automaticNumber = ReadAutomaticNumber(context);
+        if (!SelectTextRange(context, begin, paragraph.end, location) ||
+            !ReadSelectedText(context, &paragraph.text, location)) {
+            return false;
+        }
+        const std::wstring prefix = paragraph.automaticNumber.empty() ? L"" :
+            paragraph.automaticNumber + L' ';
+        // Strip only a number actually reported by HWP and only when it is
+        // absent from the inspected source. Never guess a numbering prefix.
+        if (paragraph.text != command.paragraphText && !prefix.empty() &&
+            paragraph.text.compare(0, prefix.size(), prefix) == 0) {
+            paragraph.text.erase(0, prefix.size());
+        } else {
+            paragraph.automaticNumber.clear();
+        }
+        if (paragraph.text != command.paragraphText ||
+            paragraph.text.size() > static_cast<size_t>(paragraph.end.character)) {
+            return stale(L"inspected paragraph no longer matches the native paragraph");
+        }
+        paragraph.prefixLengths.emplace(0, 0);
+        paragraph.prefixLengths.emplace(paragraph.end.character, paragraph.text.size());
+        entry = cache->emplace(key, std::move(paragraph)).first;
+    }
+    LiteralParagraph& paragraph = entry->second;
+    if (paragraph.text != command.paragraphText) {
+        return stale(L"conflicting inspected text for one paragraph");
+    }
+    const auto prefixLength = [&](LONG character, size_t* length) {
+        const auto prior = paragraph.prefixLengths.find(character);
+        if (prior != paragraph.prefixLengths.end()) {
+            *length = prior->second;
+            return true;
+        }
+        std::wstring text;
+        if (!SelectTextRange(context, begin, Position{begin.list, begin.paragraph, character}, location) ||
+            !ReadSelectedText(context, &text, location)) {
+            return false;
+        }
+        const std::wstring number = paragraph.automaticNumber.empty() ? L"" :
+            paragraph.automaticNumber + L' ';
+        if (!number.empty() && text.compare(0, number.size(), number) == 0) {
+            text.erase(0, number.size());
+        }
+        if (paragraph.text.compare(0, text.size(), text) != 0) {
+            return stale(L"native prefix does not match inspected paragraph");
+        }
+        *length = text.size();
+        paragraph.prefixLengths.emplace(character, *length);
+        return true;
+    };
+    const auto boundary = [&](LONG offset, bool start, LONG* position) {
+        const auto boundaryKey = std::make_pair(offset, start);
+        const auto prior = paragraph.boundaries.find(boundaryKey);
+        if (prior != paragraph.boundaries.end()) {
+            *position = prior->second;
+            return true;
+        }
+        LONG low = 0;
+        LONG high = paragraph.end.character;
+        if (paragraph.text.size() == static_cast<size_t>(high)) {
+            low = high = offset;
+        }
+        // Start excludes invisible cells before the literal; end excludes
+        // invisible cells after it. They are deliberately resolved separately.
+        while (low < high) {
+            const LONG middle = low + (high - low) / 2 + (start ? 1 : 0);
+            size_t length = 0;
+            if (!prefixLength(middle, &length)) { return false; }
+            if (start) {
+                if (length <= static_cast<size_t>(offset)) { low = middle; }
+                else { high = middle - 1; }
+            } else {
+                if (length < static_cast<size_t>(offset)) { low = middle + 1; }
+                else { high = middle; }
+            }
+        }
+        size_t length = 0;
+        if (!prefixLength(low, &length)) { return false; }
+        if (length != static_cast<size_t>(offset)) {
+            return stale(L"literal boundary is not representable as a native position");
+        }
+        *position = low;
+        paragraph.boundaries.emplace(boundaryKey, low);
+        return true;
+    };
+    LONG first = 0;
+    LONG last = 0;
+    if (!boundary(command.character, true, &first) ||
+        !boundary(command.endCharacter, false, &last)) {
+        return false;
+    }
+    if (last - first != command.endCharacter - command.character) {
+        return SetError(context->result, L"TEXT_RANGE_CONTROL", location,
+            L"literal spans an embedded control; split at the control before editing");
+    }
+    return SelectTextRange(context, Position{begin.list, begin.paragraph, first},
+        Position{begin.list, begin.paragraph, last}, location);
+}
+
 bool ResolveTextPatchTarget(
     Context* const context,
     const Command& command,
     const Selection& original,
-    Selection* const resolved) {
+    Selection* const resolved,
+    LiteralParagraphs* const paragraphs) {
     ReadbackPolicy policy = ReadbackPolicy::Exact;
     std::wstring location = L"current";
     if (command.name == L"CURRENT") {
@@ -1629,7 +1820,8 @@ bool ResolveTextPatchTarget(
             command.endList,
             command.endParagraph,
             command.endCharacter};
-        if (!SelectTextRange(context, start, end, location)) {
+        if (!(command.literalRange ? SelectInspectedLiteral(context, command, paragraphs) :
+                SelectTextRange(context, start, end, location))) {
             return false;
         }
     } else if (command.name == L"FIND") {
@@ -1655,7 +1847,7 @@ bool ResolveTextPatchTarget(
             listFilter = cell.list;
             location = NormalizeAddress(command.cellAddress);
         }
-        policy = ReadbackPolicy::Find;
+        policy = ReadbackPolicy::Exact;
         if (!SelectTextPatchMatch(context, command, original, listFilter)) {
             return false;
         }
@@ -1680,8 +1872,18 @@ bool ResolveTextPatchTarget(
             command.name,
             L"unsupported text.patch preflight target");
     }
-    if (!GetSelection(context->hwp, resolved, context->result) ||
-        !resolved->selected) {
+    if (!GetSelection(context->hwp, resolved, context->result)) {
+        return false;
+    }
+    if (!resolved->selected && command.name == L"CELL") {
+        Position cursor;
+        if (!GetPosition(context->hwp, &cursor, context->result)) {
+            return false;
+        }
+        *resolved = Selection{false, kSelectionNone, cursor, cursor};
+        return true;  // SelectCellTextPatchMatch already verified the empty cell.
+    }
+    if (!resolved->selected) {
         return SetError(
             context->result,
             L"TEXT_FIND_STATE",
@@ -1700,6 +1902,7 @@ ExecutionResult PreflightTextPatchTargets(
     context.hwp = hwp;
     context.request = &request;
     context.result = &result;
+    context.reuseTextPatchTopology = true;
     const auto finish = [&]() {
         result.elapsedMicroseconds = std::chrono::duration_cast<
             std::chrono::microseconds>(
@@ -1731,6 +1934,7 @@ ExecutionResult PreflightTextPatchTargets(
             return finish();
         }
         std::vector<Selection> targets;
+        LiteralParagraphs paragraphs;
         size_t requestIndex = 0;
         for (size_t commandIndex = 0;
              commandIndex < request.commands.size();
@@ -1745,7 +1949,8 @@ ExecutionResult PreflightTextPatchTargets(
                 &context,
                 command,
                 original,
-                &target);
+                &target,
+                &paragraphs);
             PreparedTextPatchTarget captured;
             if (resolved) {
                 captured.startList = target.start.list;
@@ -1770,10 +1975,7 @@ ExecutionResult PreflightTextPatchTargets(
                 hwp,
                 cursor,
                 original);
-            context.table = nullptr;
-            context.tableId.clear();
             context.currentCell.clear();
-            context.topology.Clear();
             if (!restored) {
                 result.retrySafe = false;
                 SetError(

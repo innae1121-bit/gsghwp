@@ -112,6 +112,7 @@ class CharacterStyle(ContractModel):
     height_hwpunit: int
     bold: bool
     text_color: int
+    letter_spacing_percent: int | None = Field(default=None, ge=-50, le=50)
 
 
 class ParagraphStyle(ContractModel):

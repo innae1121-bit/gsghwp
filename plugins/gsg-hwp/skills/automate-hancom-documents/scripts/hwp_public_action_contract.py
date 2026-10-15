@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import ntpath
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Annotated, Final, Literal, Protocol, cast, final
+from typing import Annotated, Final, Literal, Protocol, cast, final, override
 from uuid import uuid4
 
 from pydantic import BeforeValidator, Field, model_validator
@@ -80,6 +80,9 @@ type PublicFontName = Annotated[str, Field(min_length=1, max_length=100)]
 type PublicFontSize = Annotated[float, Field(ge=1, le=96)]
 type PublicTextColor = ColorInput
 type PublicLineSpacing = Annotated[int, Field(ge=50, le=500)]
+type PublicLetterSpacing = Annotated[int, Field(ge=-50, le=50, strict=True)]
+type PublicParagraphMargin = Annotated[float, Field(ge=0, le=200)]
+type PublicParagraphIndent = Annotated[float, Field(ge=-200, le=200)]
 type PublicReplacementText = Annotated[str, Field(max_length=1_000_000)]
 type PublicTextPatchPostSelection = Annotated[
     Literal["keep", "collapse_to_start", "collapse_to_end"],
@@ -263,10 +266,9 @@ class PublicTextPatchTarget(ContractModel):
     )
     start: PublicTextPatchPosition | None = None
     end: PublicTextPatchPosition | None = None
-    # 상한 20,000 은 ActionTextPatch.cpp:793 kMaximumSearches 에서 왔다.
-    # SelectTextPatchMatch 의 ForwardFind 루프(ActionTextPatch.cpp:815)가 정확히
-    # kMaximumSearches 회만 돌고, 한 회가 최대 한 건을 세므로 도달 가능한
-    # occurrence 는 20,000 이 끝이다. 그 위는 항상 TEXT_SEARCH_LIMIT 으로 돌아온다.
+    # 네이티브 text.patch의 occurrence 계약(1~20,000)을 유지한다.
+    # 스캔 결과 한 개에 여러 일치 항목이 있을 수 있으므로 순번 상한과
+    # SelectTextPatchMatch의 스캔 결과/문자 수 예산은 별개다.
     occurrence: int | None = Field(default=None, ge=1, le=20_000)
     match_case: bool = False
     table_instance_id: str | None = Field(
@@ -447,10 +449,76 @@ class PublicTextFormattingInput(ContractModel):
         )
 
 
+class PublicSelectionFormattingInput(PublicTextFormattingInput):
+    """Selection formatting also supports native character spacing.
+
+    Prepared text-patch batches do not yet capture per-script spacing for their
+    inverses, so their existing input model deliberately stays unchanged.
+    """
+
+    letter_spacing_percent: PublicLetterSpacing | None = None
+    left_margin_mm: PublicParagraphMargin | None = None
+    indentation_mm: PublicParagraphIndent | None = None
+    keep_with_next: bool | None = None
+    page_break_before: bool | None = None
+
+    @model_validator(mode="after")
+    def require_format(self) -> PublicSelectionFormattingInput:
+        if all(
+            value is None
+            for value in (
+                self.letter_spacing_percent,
+                self.left_margin_mm,
+                self.indentation_mm,
+                self.keep_with_next,
+                self.page_break_before,
+            )
+        ):
+            _ = PublicTextFormattingInput.model_validate(
+                self.model_dump(
+                    exclude={
+                        "letter_spacing_percent",
+                        "left_margin_mm",
+                        "indentation_mm",
+                        "keep_with_next",
+                        "page_break_before",
+                    }
+                )
+            )
+        return self
+
+    @override
+    def to_parameters(self) -> Mapping[str, OperationInputValue]:
+        parameters = dict(super().to_parameters())
+        if self.letter_spacing_percent is not None:
+            parameters["letter_spacing_percent"] = self.letter_spacing_percent
+        if self.left_margin_mm is not None:
+            parameters["left_margin_mm"] = self.left_margin_mm
+        if self.indentation_mm is not None:
+            parameters["indentation_mm"] = self.indentation_mm
+        if self.keep_with_next is not None:
+            parameters["keep_with_next"] = self.keep_with_next
+        if self.page_break_before is not None:
+            parameters["page_break_before"] = self.page_break_before
+        return parameters
+
+    @override
+    def to_live(self) -> TextFormatSpec:
+        return replace(
+            super().to_live(),
+            letter_spacing_percent=self.letter_spacing_percent,
+            left_margin_mm=self.left_margin_mm,
+            indentation_mm=self.indentation_mm,
+            keep_with_next=self.keep_with_next,
+            page_break_before=self.page_break_before,
+        )
+
+
 class PublicTextPatchItem(ContractModel):
     target: PublicTextPatchTarget = Field(default_factory=PublicTextPatchTarget)
-    expected_text: PublicExpectedText | None = Field(
+    expected_text: str | None = Field(
         default=None,
+        max_length=1_000_000,
         description=(
             "문서 구조가 반환한 리터럴 텍스트입니다. 화면에 렌더링된 자동 번호·"
             "글머리표(예: 가), ◦)는 제외합니다. 실제 리터럴 문자인 경우에는 그대로 "
@@ -458,6 +526,12 @@ class PublicTextPatchItem(ContractModel):
         ),
     )
     replacement: PublicReplacementText
+
+    @model_validator(mode="after")
+    def validate_empty_cell_guard(self) -> PublicTextPatchItem:
+        if self.expected_text == "" and self.target.kind != "table_cell":
+            _ = _non_empty_expected_text(self.expected_text)
+        return self
 
     def to_live(self) -> TextPatchRequest:
         return TextPatchRequest(

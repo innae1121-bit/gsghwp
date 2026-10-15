@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 import re
-from typing import cast
+from types import MappingProxyType
+from typing import Final, cast
 
 from pydantic import JsonValue
 
@@ -26,15 +27,64 @@ def _border(border: CellBorderObservation) -> JsonValue:
     return cast(JsonValue, border.model_dump(mode="json"))
 
 
+# Where an object-layout observation may be carried in a layout plan, by the
+# field path the public block schema actually has. These are coordinates for
+# the model, not an automatic write: several of them are the *only* route an
+# axis has, because the value arrives as a raw enumeration number this
+# repository has never measured the name of.
+#
+#   * ``table_borders`` and the border half of the fill/height policy axis
+#     report ``HCellBorderFill/BorderType*`` and ``BorderWidth*`` as numbers,
+#     while ``CellBorder.style``/``width`` accept only names; HWP resolves the
+#     name at write time through ``hwp.HwpLineType``/``HwpLineWidth`` and the
+#     reverse direction is measured nowhere here.
+#   * ``table_cell_alignment``'s vertical half is ``ShapeTableCell/VertAlign``,
+#     which ``TableInspection.cpp`` notes has no write-path counterpart in this
+#     repository at all -- vertical alignment is written by the
+#     ``TableVAlign*`` actions instead.
+#
+# ``table_header_repetition`` stays empty on purpose: the field it would name
+# (``blocks[].repeat_header``) exists, but the axis is permanently unobserved,
+# and pointing at a destination for evidence that never arrives would read as
+# a promise. Every other empty tuple below is the same kind of statement.
+TABLE_AXIS_WRITE_FIELDS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
+    {
+        "table_topology": ("blocks[].merges",),
+        "table_header_repetition": (),
+        "table_cell_alignment": (
+            "blocks[].rows[][].alignment",
+            "blocks[].rows[][].vertical_alignment",
+        ),
+        "table_font_weight": (
+            "blocks[].rows[][].font_name",
+            "blocks[].rows[][].font_size_pt",
+            "blocks[].rows[][].bold",
+        ),
+        "table_borders": ("blocks[].rows[][].borders",),
+        "table_border_fill_row_height_policy": (
+            "blocks[].rows[][].fill_color",
+            "blocks[].rows[][].borders",
+            "blocks[].row_heights_mm",
+        ),
+        "numeric_display_pattern": ("blocks[].rows[][].text",),
+        "caption_placement": (
+            "blocks[].caption",
+            "blocks[].caption_style_id",
+        ),
+        "caption_sequence": ("blocks[].caption",),
+        "figure_layout": ("blocks[].width_mm", "blocks[].height_mm"),
+    }
+)
+
+
 def _sampled_axis(
     name: str,
     observations: Iterable[tuple[JsonValue, int]],
-    *write_fields: str,
 ) -> ConventionAxis:
     return build_axis(
         name,
         observations,
-        write_fields=write_fields,
+        write_fields=TABLE_AXIS_WRITE_FIELDS[name],
         scope="current-page",
         complete=False,
     )
@@ -83,27 +133,7 @@ def object_layout_axes(
                 scope="current-page",
                 unobserved_reason=reason,
             )
-            for name, write_fields in (
-                ("table_topology", ()),
-                ("table_header_repetition", ()),
-                ("table_cell_alignment", ()),
-                (
-                    "table_font_weight",
-                    (
-                        "blocks[].rows[][].font_name",
-                        "blocks[].rows[][].bold",
-                    ),
-                ),
-                ("table_borders", ()),
-                ("table_border_fill_row_height_policy", ()),
-                ("numeric_display_pattern", ()),
-                (
-                    "caption_placement",
-                    ("blocks[].caption", "blocks[].caption_style_id"),
-                ),
-                ("caption_sequence", ()),
-                ("figure_layout", ()),
-            )
+            for name, write_fields in TABLE_AXIS_WRITE_FIELDS.items()
         )
     topology: list[tuple[JsonValue, int]] = []
     alignments: list[tuple[JsonValue, int]] = []
@@ -261,29 +291,19 @@ def object_layout_axes(
         build_axis(
             "table_header_repetition",
             (),
-            write_fields=(),
+            write_fields=TABLE_AXIS_WRITE_FIELDS["table_header_repetition"],
             scope="current-page",
             unobserved_reason="현재 구조 응답에는 반복 머리행 여부가 없습니다.",
         ),
         _sampled_axis("table_cell_alignment", alignments),
-        _sampled_axis(
-            "table_font_weight",
-            fonts,
-            "blocks[].rows[][].font_name",
-            "blocks[].rows[][].bold",
-        ),
+        _sampled_axis("table_font_weight", fonts),
         _sampled_axis("table_borders", borders),
         _sampled_axis(
             "table_border_fill_row_height_policy",
             table_border_fill_heights,
         ),
         _sampled_axis("numeric_display_pattern", numeric_display),
-        _sampled_axis(
-            "caption_placement",
-            captions,
-            "blocks[].caption",
-            "blocks[].caption_style_id",
-        ),
+        _sampled_axis("caption_placement", captions),
         _sampled_axis("caption_sequence", caption_sequence),
         _sampled_axis("figure_layout", figures),
     )

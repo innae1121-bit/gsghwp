@@ -381,6 +381,43 @@ _LABEL_RUN_COVERAGE_RATIO: Final = 0.5
 # (원래 앵커에서 경로를 벗겨 낸 이유가 그것이다). 6개면 실사례의 소제목(세
 # 조각)을 조각째 싣고도 다른 라벨 두엇이 더 들어가며 값은 700바이트 언저리다.
 _CROP_PATH_BUDGET: Final = 6
+# 인라인에 실어 보낼 컨택트시트의 최대 장수.
+#
+# 시트 한 장은 pretty-print 산출물 항목 하나이고, 값은 고정 190바이트(kind·
+# size_bytes·sha256 64자·중괄호·들여쓰기)에 경로 길이가 얹힌다(실측: 경로
+# 138자 → 329바이트, 576자 → 786바이트, 1,036자 → 1,266바이트). 상한이 없던
+# 시절에는 그 값이 장수만큼 곱해져, 깊이 20 경로에 60장이면 산출물 블록만
+# 47,000바이트 — 예산 18,900바이트(=9,000토큰 × 2.1)의 2.5배다. 그래서 골격
+# (증거가 한 줄도 없는 응답 뼈대)이 예산 코앞에 서거나 아예 넘겼고, 넘긴
+# 자리는 enforce 가 산출물을 통째로 내려 메웠다 — depth 10~20 × sheets 10~60
+# 스윕 561점에서 증거 0이 25점, 산출물 0이 399점이었다.
+#
+# 4로 둔 근거는 세 쪽이다.
+#
+#   - 밴드가 사라지는 여유가 가장 크다. 561점 스윕은 4·6·8 모두 증거 0을 0점으로
+#     만들지만, 경로를 더 깊게(20~40) 밀면 갈린다. 실측 최소 증거 항목 수는
+#     4에서 30, 6에서 22, 8에서 14 이고 12에서는 깊이 40이 다시 증거 0을 낸다.
+#     4는 그 벼랑에서 가장 멀다.
+#   - 대표성이 충분하다. 시트 한 장이 타일 4장을 담으므로 4장이면 타일 16장어치
+#     이고, 첫 장만 남기는 것과 달리 앞뒤를 붙들고 고르게 솎으므로
+#     (_sampled_sheet_indices) 덮는 자리가 페이지 위쪽에 쏠리지 않는다.
+#   - 나머지를 인라인으로 나르는 값어치가 애초에 낮다. 시트는 같은 디렉터리에
+#     contact-sheet-NN 으로 놓이므로(save_contact_sheets), 실린 경로 하나와
+#     총수만 있으면 나머지 경로는 지어낼 수 있다. 그 총수·나머지 수·집는 길을
+#     counts.contact_sheets·omissions·reason_codes 가 함께 신고한다.
+#
+# 장수가 이 상한 이하인 문서는 예전과 한 바이트도 다르지 않다. 넘는 문서는
+# 시트 기록 몇 줄을 좌표 증거로 바꿔 싣는 셈인데, 좌표는 되받을 section 이
+# 있어도 예산 안에서 먼저 보여야 값어치가 있고 시트는 이름으로 지어낼 수 있다.
+_CONTACT_SHEET_INLINE_BUDGET: Final = 4
+# 솎아 냈을 때 응답이 스스로 붙이는 안내다. 스키마를 늘리지 않고 "나머지를
+# 어디서 어떻게 집는가" 를 말할 수 있는 자리가 reason_codes 뿐이라 여기에 적는다.
+# 첫 줄은 되받을 section 을 지목하고(hwp_get_reference_image_analysis_section
+# 이 section="artifacts" 를 실제로 지원한다 — _all_artifacts 가 시트를 전량
+# 돌려준다), 둘째 줄은 인라인 경로에서 나머지 경로를 곧바로 지어낼 수 있음을
+# 밝힌다(같은 디렉터리, contact-sheet-NN 이라는 결정적 이름).
+_CONTACT_SHEET_SAMPLED_CODE: Final = "CONTACT_SHEETS_SAMPLED_SEE_ARTIFACTS_SECTION"
+_CONTACT_SHEET_NAMING_CODE: Final = "CONTACT_SHEET_SIBLINGS_NAMED_CONTACT_SHEET_NN"
 # 좌표를 적는 자릿수. 이 모듈은 이미 breakpoint 를 6자리로 적고 있고(_cluster_
 # coordinates), 정규 좌표 1e-6 은 2613px 폭에서 0.0026px 라 화면 정밀도보다
 # 훨씬 잘다. 17자리를 그대로 실으면 같은 예산에 절반밖에 못 싣는다.
@@ -688,6 +725,10 @@ def fill_compact_evidence(
     if result.draft_reference_layout is not None or not result.analysis_complete:
         # 초안을 낸 응답은 그 초안이 이미 예산의 임자다. 조기 종료 응답은
         # 캐시가 없어 되받을 section 자체가 없다. 둘 다 손대지 않는다.
+        #
+        # 다만 "임자다" 는 그 초안이 실제로 실려 나갈 때만 참이다. 예산이
+        # 초안을 통째로 내리면 임자가 없어지므로, 그때는 이 함수를 한 번 더
+        # 부른다(compact_reference_image_analysis 참고).
         return result
     candidates = _evidence_candidates(analysis)
     base = _with_response_size(
@@ -1264,20 +1305,60 @@ def _artifact(path: Path, kind: ReferenceArtifactKind) -> ReferenceArtifact | No
     )
 
 
+def _sampled_sheet_indices(count: int, limit: int) -> tuple[int, ...]:
+    """시트 목록에서 인라인에 남길 자리를 고른다.
+
+    앞에서 limit 장을 자르지 않는다. 시트는 타일 읽는 차례(왼쪽 위 → 오른쪽
+    아래)대로 묶여 있어서, 앞만 남기면 덮는 자리가 페이지 위쪽에 쏠린다. 첫
+    장과 끝 장을 붙들고 그 사이를 고르게 나눠 뽑아, 남긴 몇 장이 페이지 전체에
+    퍼지게 한다.
+    """
+    if count <= limit:
+        return tuple(range(count))
+    # 여기까지 왔으면 count > limit 이라 count 는 1장 이상이다.
+    if limit <= 1:
+        return (0,) if limit == 1 else ()
+    last = count - 1
+    return tuple(
+        sorted({round(index * last / (limit - 1)) for index in range(limit)})
+    )
+
+
 def _compact_artifacts(
     analysis: ReferenceImageAnalysis,
-) -> tuple[ReferenceArtifact, ...]:
+) -> tuple[tuple[ReferenceArtifact, ...], int]:
+    """인라인 산출물과, 상한에 밀려 빠진 컨택트시트 수를 함께 낸다.
+
+    빠진 수를 함께 내는 것이 이 함수의 계약이다. 개수만 줄이고 말없이 넘기면
+    응답은 "시트가 이것뿐" 이라고 거짓말하게 된다 — 부르는 쪽이 이 값으로
+    누락 신고를 세운다.
+    """
     result_path = analysis.overlay_path.parent / "result.json"
+    sheets = analysis.contact_sheet_paths
+    picked = frozenset(
+        _sampled_sheet_indices(len(sheets), _CONTACT_SHEET_INLINE_BUDGET)
+    )
     candidates: list[tuple[Path, ReferenceArtifactKind]] = [
         (result_path, "analysis"),
         (analysis.overlay_path, "overlay"),
     ]
-    candidates.extend((path, "contact_sheet") for path in analysis.contact_sheet_paths)
-    return tuple(
+    candidates.extend(
+        (path, "contact_sheet")
+        for index, path in enumerate(sheets)
+        if index in picked
+    )
+    artifacts = tuple(
         artifact
         for path, kind in candidates
         if (artifact := _artifact(path, kind)) is not None
     )
+    # 신고하는 수는 "section 이 돌려줄 텐데 여기 없는 시트" 다. 파일이 사라진
+    # 시트는 section(_all_artifacts) 도 내지 않으므로 세지 않는다 — 세면
+    # 집을 수 없는 것을 집으라고 보내는 셈이다.
+    omitted = sum(
+        path.is_file() for index, path in enumerate(sheets) if index not in picked
+    )
+    return artifacts, omitted
 
 
 def _stopped_reason_codes(analysis: ReferenceImageAnalysis) -> tuple[str, ...]:
@@ -1365,6 +1446,23 @@ def _build_compact_reference_image_analysis(
         reasons = list(_stopped_reason_codes(analysis))
         draft = None
         result_path = None
+    artifacts, omitted_sheets = _compact_artifacts(analysis)
+    # 솎아 낸 시트를 응답이 스스로 신고한다. 총수는 counts.contact_sheets 가,
+    # 실린 수는 artifacts 가, 나머지 수와 되받을 section 은 이 신고가 말한다.
+    #
+    # 이 자리가 미완 분석 갈림길 뒤인 것은 사유 코드가 거기서 통째로 갈리기
+    # 때문이다. 미완 분석은 contact_sheet_paths 가 언제나 비어 있어(분석기가
+    # 시트를 만들기 전에 끊는다) 여기서 코드가 덧붙는 일 자체가 없다.
+    sheet_omissions: tuple[ReferenceCompactOmission, ...] = ()
+    if omitted_sheets:
+        sheet_omissions = (
+            ReferenceCompactOmission(
+                section="artifacts",
+                axis="artifacts",
+                omitted_count=omitted_sheets,
+            ),
+        )
+        reasons.extend((_CONTACT_SHEET_SAMPLED_CODE, _CONTACT_SHEET_NAMING_CODE))
     return CompactReferenceImageAnalysis(
         analysis_id=analysis.analysis_id,
         analyzer_version=analysis.analyzer_version,
@@ -1406,19 +1504,70 @@ def _build_compact_reference_image_analysis(
             "artifacts",
         ),
         analysis_result_path=result_path,
-        artifacts=_compact_artifacts(analysis),
+        artifacts=artifacts,
+        omissions=sheet_omissions,
     )
+
+
+def _payload_tally(result: CompactReferenceImageAnalysis) -> tuple[int, int, int]:
+    """이 응답이 실제로 나르는 것의 수 — 증거 항목·산출물·되받을 경로.
+
+    누락 신고는 세지 않는다. 신고는 "여기 더 있다" 는 말이지 그 자체가 관측이
+    아니어서, 신고를 늘리고 관측을 줄인 응답을 나아졌다고 셈하면 안 된다.
+    """
+    evidence = sum(
+        len(cast(tuple[ContractModel, ...], getattr(result.evidence, axis)))
+        for axis, _, _ in _EVIDENCE_PRIORITY
+    )
+    paths = sum(
+        item is not None for item in (result.source_image, result.analysis_result_path)
+    )
+    return evidence, len(result.artifacts), paths
 
 
 def compact_reference_image_analysis(
     analysis: ReferenceImageAnalysis,
 ) -> CompactReferenceImageAnalysis:
-    return enforce_compact_response_budget(
-        fill_compact_evidence(
-            _build_compact_reference_image_analysis(analysis),
-            analysis,
-        )
+    built = _build_compact_reference_image_analysis(analysis)
+    bounded = enforce_compact_response_budget(fill_compact_evidence(built, analysis))
+    dropped_draft = (
+        built.draft_reference_layout is not None
+        and bounded.draft_reference_layout is None
     )
+    if not dropped_draft:
+        return bounded
+    # 초안이 예산에 밀려 통째로 내려갔다. 채우기는 "초안이 예산의 임자" 라며
+    # 비켜섰는데 그 임자가 사라졌으니, 임자 없는 예산을 그대로 비워 보내면
+    # 응답에 좌표가 한 줄도 없다 — 실측에서 조밀한 격자 페이지가 objects 254·
+    # text_regions 89 를 재 놓고 2,537바이트짜리 껍데기만 냈고, omissions 에는
+    # draft 한 줄뿐이라 소비자는 되집을 축이 있다는 사실조차 알지 못했다.
+    #
+    # 그래서 내려간 뒤에 다시 채운다. 미리 초안 크기를 재서 갈림길을 앞당기는
+    # 길도 있지만, 그러려면 "예산을 넘는가" 를 여기서 한 번 더 판정해야 하고 그
+    # 판정은 enforce 가 이미 가진 것이다. 두 벌로 두면 어긋난다.
+    #
+    # 되채운 응답에는 초안 누락 신고가 그대로 남아 있고(bounded.omissions 를
+    # 물려받는다), 새로 못 실은 축은 채우기가 제 몫대로 덧붙인다. 마지막
+    # enforce 는 채우기가 예산을 넘겼을 때만 일하지만, 넘기지 않는다는 보장을
+    # 이 자리에서 다시 세워 둔다.
+    refilled = enforce_compact_response_budget(fill_compact_evidence(bounded, analysis))
+    # 되채우기가 언제나 남는 장사는 아니다. 초안을 내린 골격이 이미 예산의
+    # 코앞이면(실측: 컨택트시트 24장이 깊은 경로에 놓인 페이지가 8,608토큰)
+    # 남은 자리가 항목 하나 값도 못 되는데, 채우기는 그래도 축마다 누락 신고를
+    # 덧붙여 예산을 넘기고, 그 초과를 enforce 가 산출물 경로를 통째로 내려
+    # 메운다 — 증거 0·산출물 0 짜리 1,918토큰 응답이 나와서 되채우기 전보다
+    # 오히려 적게 실린다(실측 3구간: 8,608/24 → 1,918/0, 8,859/24 → 1,918/0,
+    # 8,652/22 → 1,918/0).
+    #
+    # 그래서 되채우기는 제안이지 확정이 아니다. 증거를 한 항목도 싣지 못했거나
+    # 나르던 것을 하나라도 줄였으면 제안을 버리고 골격을 그대로 낸다. 이 비교는
+    # 값이 세 개짜리 튜플 둘을 견주는 것이라 값싸고, "되채우기는 절대 손해가
+    # 아니다" 를 계약으로 만든다.
+    before = _payload_tally(bounded)
+    after = _payload_tally(refilled)
+    if after[0] == 0 or any(now < was for now, was in zip(after, before, strict=True)):
+        return bounded
+    return refilled
 
 
 def _load_analysis_by_id(

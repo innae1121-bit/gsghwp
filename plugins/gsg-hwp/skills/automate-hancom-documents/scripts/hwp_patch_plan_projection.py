@@ -64,6 +64,7 @@ def _items(
     include_cells: bool,
 ) -> tuple[PatchFact, ...]:
     facts: list[PatchFact] = []
+    paragraphs_by_target: dict[tuple[int, int, int], ParagraphPatchFact] = {}
     cells_by_target: dict[tuple[str, str], CellPatchFact] = {}
     for structure in sorted(structures, key=lambda item: item.page):
         if include_paragraphs:
@@ -71,36 +72,40 @@ def _items(
                 if not paragraph.text_available or paragraph.position is None:
                     continue
                 heading_type = paragraph.paragraph_style.heading_type
-                # 자동 번호·불릿(heading_type 2·3)은 표시용 마커가 본문 앞에
-                # 붙어 오고, 그 마커는 패치 대상이 아니라 건너뛴다. 건너뛰는
-                # 길이를 한 글자로 두는 것은 관측값이다 -- 현장 문단이 text
-                # 23단위로 오고 실제 편집 가능한 끝도 23이었다.
-                marker = paragraph.text[:1] if heading_type in (2, 3) else ""
-                text = paragraph.text[len(marker) :]
+                # The structure scanner returns literal text. Heading metadata
+                # does not identify a removable character in that text.
+                text = paragraph.text
                 base = paragraph.position
-                start = base.model_copy(
-                    update={"character": base.character + _utf16_units(marker)}
-                )
-                # 끝은 언제나 문단 원점에서 잰다. 마커를 건너뛴 start 에 마커까지
-                # 포함한 전체 길이를 다시 더하면 정확히 마커 길이만큼 문단 밖으로
-                # 넘친다(현장 재현: 요청 0:12:1-24, 실제 끝은 23). 이 결론은 위의
-                # 한 글자 전제와 무관하게 성립한다.
+                start = base
                 end = base.model_copy(
                     update={"character": base.character + _utf16_units(paragraph.text)}
                 )
-                facts.append(
-                    ParagraphPatchFact(
-                        id=(
-                            f"p:{structure.page}:{start.list_id}:"
-                            f"{start.paragraph}:{start.character}:{end.character}"
-                        ),
-                        page=structure.page,
-                        text=text,
-                        target=PatchRangeTarget(start=start, end=end),
-                        heading_type=heading_type,
-                        heading_level=paragraph.paragraph_style.heading_level,
-                    )
+                fact = ParagraphPatchFact(
+                    id=(
+                        f"p:{structure.page}:{start.list_id}:"
+                        f"{start.paragraph}:{start.character}:{end.character}"
+                    ),
+                    page=structure.page,
+                    text=text,
+                    target=PatchRangeTarget(start=start, end=end),
+                    heading_type=heading_type,
+                    heading_level=paragraph.paragraph_style.heading_level,
                 )
+                paragraph_key = (start.list_id, start.paragraph, start.character)
+                previous_paragraph = paragraphs_by_target.get(paragraph_key)
+                if previous_paragraph is not None:
+                    if (
+                        previous_paragraph.text != fact.text
+                        or previous_paragraph.heading_type != fact.heading_type
+                        or previous_paragraph.heading_level != fact.heading_level
+                    ):
+                        raise HwpLiveError(
+                            "patch plan page-spanning paragraph is inconsistent: "
+                            + f"target={paragraph_key}"
+                        )
+                    continue
+                paragraphs_by_target[paragraph_key] = fact
+                facts.append(fact)
         if include_cells:
             # A failed table is excluded, not the page. hwp_live_native_structure
             # already drops the failed controls from ``tables`` and keeps every
@@ -120,11 +125,25 @@ def _items(
                     raise HwpLiveError(
                         f"patch plan 표의 native instance id가 없습니다: {table.table_ref}"
                     )
+                owners = {
+                    cell.address
+                    for cell in table.cells
+                    if cell.address == cell.owner_address
+                }
                 for cell in sorted(
                     table.cells, key=lambda item: (item.row, item.column)
                 ):
+                    if cell.owner_address not in owners:
+                        raise HwpLiveError(
+                            "patch plan merged cell owner is missing: "
+                            + f"table={table_id}, cell={cell.address}, "
+                            + f"owner={cell.owner_address}"
+                        )
+                    # Covered grid slots are not independently editable cells.
+                    if cell.address != cell.owner_address:
+                        continue
                     key = (table_id, cell.address)
-                    fact = CellPatchFact(
+                    cell_fact = CellPatchFact(
                         id=f"c:{table_id}:{cell.address}",
                         page=structure.page,
                         text=cell.text,
@@ -135,14 +154,14 @@ def _items(
                     )
                     previous = cells_by_target.get(key)
                     if previous is not None:
-                        if previous.text != fact.text:
+                        if previous.text != cell_fact.text:
                             raise HwpLiveError(
                                 "patch plan page-spanning cell text is inconsistent: "
                                 + f"table={table_id}, cell={cell.address}"
                             )
                         continue
-                    cells_by_target[key] = fact
-                    facts.append(fact)
+                    cells_by_target[key] = cell_fact
+                    facts.append(cell_fact)
     return tuple(facts)
 
 

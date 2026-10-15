@@ -7,6 +7,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from difflib import SequenceMatcher
+from functools import lru_cache
 from types import MappingProxyType
 from typing import Final, Protocol, TypeVar
 
@@ -251,6 +252,12 @@ _INTENT_ALIASES: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
             "셀 배경 테두리",
             "표 글자 정렬",
         ),
+        "hwp_set_table_size_fixed": (
+            "표 크기 고정",
+            "표 개체 크기 고정",
+            "크기고정",
+            "ProtectSize",
+        ),
         "hwp_analyze_reference_image": (
             "참고 이미지 분석",
             "전역 좌표 분석",
@@ -429,6 +436,31 @@ def _composite_intent_priority(query_terms: frozenset[str], name: str) -> int:
     return 0
 
 
+# One ranking pass re-tokenizes the whole corpus: 211 intent aliases plus every
+# spec's name and description, 363 fixed strings, on top of the query's own few.
+# Measured over 10 representative queries the distinct argument count is 372 for
+# both `_search_terms` and `_compact`, so 1024 keeps the fixed corpus resident
+# permanently and still leaves ~660 slots of query history. Bound: ~1024 short
+# strings and their frozensets, single-digit MB.
+_TERM_CACHE_SIZE: Final = 1024
+# `_similar_term` is the hot one -- 60,594 calls in a single `hwp_search_tools`
+# against 6,819 distinct (query term, corpus term) pairs, so most calls repeat
+# inside one query and the rest repeat across queries that share a term. Sizing
+# was swept over a 20-query workload rather than guessed; five-query medians and
+# residency at full capacity:
+#   4096 -> 54.2ms / 57% hit / 1.5MiB     32768 -> 47.8ms / 67% hit /  6.7MiB
+#   8192 -> 51.2ms / 60% hit / 2.1MiB     65536 -> 11.1ms / 85% hit / 12.7MiB
+#  16384 -> 52.1ms / 63% hit / 3.7MiB    131072 -> 10.4ms / 93% hit / 17.4MiB
+# The knee is 65536: it is where a whole working set stops being evicted between
+# queries, and doubling past it buys 6% for another 37% of memory. Keys are
+# pairs of strings the corpus and query already hold, so the residency above is
+# almost entirely LRU link nodes.
+_SIMILARITY_CACHE_SIZE: Final = 65536
+
+
+# Pure: reads only the module-level suffix tuples and the frozen stem mapping,
+# returns an immutable frozenset. Safe to memoize.
+@lru_cache(maxsize=_TERM_CACHE_SIZE)
 def _search_terms(value: str) -> frozenset[str]:
     terms: set[str] = set()
     raw_terms: list[str] = re.findall(r"[0-9a-zA-Z가-힣_]+", value.casefold())
@@ -450,10 +482,12 @@ def _search_terms(value: str) -> frozenset[str]:
     return frozenset(term for term in terms if term)
 
 
+@lru_cache(maxsize=_TERM_CACHE_SIZE)
 def _compact(value: str) -> str:
     return "".join(re.findall(r"[0-9a-zA-Z가-힣_]+", value.casefold()))
 
 
+@lru_cache(maxsize=_SIMILARITY_CACHE_SIZE)
 def _similar_term(left: str, right: str) -> bool:
     if left == right:
         return True

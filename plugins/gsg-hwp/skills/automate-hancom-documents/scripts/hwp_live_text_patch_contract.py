@@ -9,6 +9,7 @@ from hwp_live_edit_history import (
     DocumentCheckpointEvidence,
 )
 from hwp_live_native_action_models import (
+    LiteralTextRange,
     NativeActionResult,
     NativePosition,
     NativeSnapshot,
@@ -63,6 +64,7 @@ class TextPatchRequest:
     replacement: str
     formatting: TextFormatSpec | None = None
     post_selection: TextPatchPostSelection = "keep"
+    literal_range: LiteralTextRange | None = None
 
 
 def validate_text_patch_request(

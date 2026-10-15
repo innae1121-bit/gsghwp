@@ -117,7 +117,6 @@ class CellSelectionState:
 
 def _capture_cell_selection(
     candidate: PreviewCandidate,
-    target_page: int,
     selection_mode: int,
     guard: Callable[[], None],
 ) -> CellSelectionState:
@@ -131,10 +130,12 @@ def _capture_cell_selection(
         snapshot.selection.mode != selection_mode
         or not is_table_control_type(snapshot.control_type)
         or not snapshot.control_instance_id
-        or len(snapshot.selection.cell_addresses) < 2
+        or not snapshot.selection.cell_addresses
     ):
         raise HwpLiveError("셀 블록 미리보기 선택 상태가 올바르지 않습니다")
-    detail = inspect_native_structure(candidate.window_handle, target_page)
+    # The selection belongs to the cursor page, not necessarily the page the
+    # caller asked to render.
+    detail = inspect_native_structure(candidate.window_handle, snapshot.current_page)
     guard()
     if detail is None:
         raise HwpLiveError("셀 블록 미리보기 표 구조를 읽을 수 없습니다")
@@ -204,8 +205,11 @@ def _restore_cell_selection(
     if not hwp.set_pos(state.first_list_id, 0, 0):
         raise HwpLiveError("미리보기 후 셀 블록 시작 위치를 복원하지 못했습니다")
     guard()
-    if not hwp.TableCellBlock() or not hwp.TableCellBlockExtend():
+    if not hwp.TableCellBlock():
         raise HwpLiveError("미리보기 후 셀 블록 선택을 시작하지 못했습니다")
+    guard()
+    if (state.path or state.selection_mode & 0x10) and not hwp.TableCellBlockExtend():
+        raise HwpLiveError("미리보기 후 셀 블록 확장을 시작하지 못했습니다")
     guard()
     for step in state.path:
         moved = hwp.TableRightCell() if step == "right" else hwp.TableLowerCell()
@@ -370,7 +374,6 @@ def _render_page(
     cell_selection = (
         _capture_cell_selection(
             candidate,
-            target_page,
             selection_mode,
             guard,
         )
@@ -391,6 +394,7 @@ def _render_page(
     partial_path = (
         output_directory / f".rendering-page-{target_page:03}-{render_id}.png"
     )
+    bitmap_path = partial_path.with_suffix(".bmp")
     path = output_directory / f"page-{target_page:03}-{render_id}.png"
     published = False
     try:
@@ -409,7 +413,14 @@ def _render_page(
 
                 def render_once() -> bool:
                     partial_path.unlink(missing_ok=True)
+                    bitmap_path.unlink(missing_ok=True)
                     if not has_selection or restorable_selection:
+                        if cursor[0] != 0:
+                            if not hwp.set_pos(0, 0, 0):
+                                raise HwpLiveError(
+                                    "한컴 미리보기 전에 본문으로 이동하지 못했습니다"
+                                )
+                            guard()
                         _ = hwp.RecalcPageCount()
                         guard()
                         moved = hwp.goto_page(target_page)
@@ -429,17 +440,20 @@ def _render_page(
                                 "한컴 미리보기 쪽으로 이동하지 못했습니다"
                             )
                         rendered_once = hwp.create_page_image(
-                            str(partial_path),
+                            str(bitmap_path),
                             pgno=0,
                             resolution=dpi,
                         )
                     else:
                         rendered_once = hwp.create_page_image(
-                            str(partial_path),
+                            str(bitmap_path),
                             pgno=target_page,
                             resolution=dpi,
                         )
                     guard()
+                    if rendered_once:
+                        with Image.open(bitmap_path) as image:
+                            image.save(partial_path, format="PNG")
                     return rendered_once
 
                 rendered = render_once()
@@ -503,5 +517,6 @@ def _render_page(
         published = True
         return PreviewResult(page=target_page, path=path)
     finally:
+        bitmap_path.unlink(missing_ok=True)
         if not published:
             partial_path.unlink(missing_ok=True)

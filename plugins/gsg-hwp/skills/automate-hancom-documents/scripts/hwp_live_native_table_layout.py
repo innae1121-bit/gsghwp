@@ -138,35 +138,32 @@ def _size_action(name: str, millimeters: float) -> ParameterActionCommand:
     )
 
 
-def _select_range(
-    first: str,
-    move_action: str,
-    count: int,
+def _geometry_commands(
+    block: TableBlock, *, include_columns: bool = True
 ) -> tuple[NativeActionCommand, ...]:
-    return (
-        CellCommand(first),
-        RunCommand("TableCellBlock"),
-        RunCommand("TableCellBlockExtend"),
-        *(RunCommand(move_action) for _ in range(count)),
-    )
-
-
-def _geometry_commands(block: TableBlock) -> tuple[NativeActionCommand, ...]:
     commands: list[NativeActionCommand] = []
-    rows = len(block.rows)
-    columns = len(block.rows[0])
-    if block.column_widths_mm is not None:
+    # Geometry runs before any merge, so every axis has an unambiguous cell.
+    # Select the whole axis once instead of walking every grid slot.
+    if include_columns and block.column_widths_mm is not None:
         for column, width in enumerate(block.column_widths_mm):
             commands.extend(
-                _select_range(cell_address(0, column), "TableLowerCell", rows - 1)
+                (
+                    CellCommand(cell_address(0, column)),
+                    RunCommand("TableCellBlockCol"),
+                    _size_action("Width", width),
+                    RunCommand("Cancel"),
+                )
             )
-            commands.extend((_size_action("Width", width), RunCommand("Cancel")))
     if block.row_heights_mm is not None:
         for row, height in enumerate(block.row_heights_mm):
             commands.extend(
-                _select_range(cell_address(row, 0), "TableRightCell", columns - 1)
+                (
+                    CellCommand(cell_address(row, 0)),
+                    RunCommand("TableCellBlockRow"),
+                    _size_action("Height", height),
+                    RunCommand("Cancel"),
+                )
             )
-            commands.extend((_size_action("Height", height), RunCommand("Cancel")))
     return tuple(commands)
 
 
@@ -188,17 +185,70 @@ def _picture_command(
 
 def _merge_commands(block: TableBlock) -> tuple[NativeActionCommand, ...]:
     commands: list[NativeActionCommand] = []
+    rows = len(block.rows)
     columns = len(block.rows[0])
-    anchors: list[list[int]] = [list(range(columns)) for _ in range(len(block.rows))]
+
+    # 한/글의 셀 주소는 "그 행에 남은 셀의 순번"이 아니라 표에 아직 살아 있는
+    # 격자선의 좌표다. 격자선 하나는 그것을 넘지 않는 셀이 한 칸이라도 남아
+    # 있는 동안 살아 있고, 모든 칸이 그 선을 넘어버릴 때만 사라지면서 그 뒤의
+    # 주소가 한 칸씩 당겨진다.
+    #
+    # 라이브 실측(2026-09-03, 등록된 0.5.176 브리지, 일회용 인스턴스에서
+    # InspectStructure 로 매 단계 되읽음):
+    #   6x4 표에서 A2:B2 만 합침 → 2행이 "A2[1x2] C2 D2 E2 F2".
+    #     흡수된 B2 만 사라지고 C2 는 그대로 C2 다(주소가 당겨지지 않는다).
+    #   이어서 A3:B3, C2:D2, C3:D3 를 합친 뒤 원본 좌표 C2:C3 로 세로를 닫음
+    #     → 성공, "C2[2x2]". 원본 좌표가 정답이다.
+    #   그 상태에서 코호트 밖 세로 병합을 원본 좌표 F2:F3 로 보냄 → 성공.
+    #     같은 셀을 행-압축 좌표 D2:D3 로 보내면 한/글이
+    #     "merge endpoints are not present in forward order" 로 거부한다
+    #     (D2 는 C2 의 열스팬에 흡수되어 이미 없는 주소다). 이것이 실사용
+    #     .xls 배치가 2,644 번째 명령에서 멈춘 그 거부다.
+    #   4x4 표에서 A1:B4(표의 모든 행을 덮는 4x2) 를 합침 → "A1[4x1] B1 C1",
+    #     즉 A|B 격자선이 통째로 사라져 원본 C·D 가 B·C 로 당겨진다. 이때는
+    #     원본 좌표 C1:D1 이 거부되고 B1:C1 이 정답이다.
+    #   6x4 표에서 2·3행의 마지막 독립 쌍까지 세로로 닫으면 두 행 사이 격자선이
+    #     사라져 원본 4행이 3행으로 당겨진다(행 번호도 같은 규칙이다).
+    #
+    # 그래서 장부는 "원본 격자 칸 → 그 칸을 소유한 병합의 앵커"이고, 주소는
+    # 살아 있는 격자선을 세어 만든다. 두 경로(코호트·비코호트)가 같은 장부를
+    # 쓰므로 한 표 안에서 주소 체계가 섞이지 않는다.
+    owners: list[list[tuple[int, int]]] = [
+        [(row, column) for column in range(columns)] for row in range(rows)
+    ]
+    column_spanned = [0] * columns
+    row_spanned = [0] * rows
+
+    def _absorb(merge: TableMerge) -> None:
+        anchor = (merge.row, merge.column)
+        for row in range(merge.row, merge.row + merge.row_span):
+            for column in range(merge.column, merge.column + merge.column_span):
+                owners[row][column] = anchor
+        for boundary in range(merge.column + 1, merge.column + merge.column_span):
+            column_spanned[boundary] = sum(
+                1
+                for row in range(rows)
+                if owners[row][boundary - 1] == owners[row][boundary]
+            )
+        for boundary in range(merge.row + 1, merge.row + merge.row_span):
+            row_spanned[boundary] = sum(
+                1
+                for column in range(columns)
+                if owners[boundary - 1][column] == owners[boundary][column]
+            )
 
     def _live_address(row: int, column: int) -> str:
-        try:
-            letter_index = anchors[row].index(column)
-        except ValueError as error:
+        if owners[row][column] != (row, column):
             raise HwpLiveError(
                 f"표 병합 주소 계산이 이미 병합된 셀을 가리켰습니다: 행 {row + 1}, 열 {column + 1}"
-            ) from error
-        return cell_address(row, letter_index)
+            )
+        letter_index = sum(
+            1 for boundary in range(1, column + 1) if column_spanned[boundary] < rows
+        )
+        row_index = sum(
+            1 for boundary in range(1, row + 1) if row_spanned[boundary] < columns
+        )
+        return cell_address(row_index, letter_index)
 
     # 행 구간이 겹치는 복합(가로+세로) 병합만 한/글의 직접 사각형 경로가
     # 불안정하다. 그런 구간은 모든 행을 우→좌로 먼저 합친 뒤 세로 앵커를
@@ -231,7 +281,7 @@ def _merge_commands(block: TableBlock) -> tuple[NativeActionCommand, ...]:
         cohorts.append(tuple(component))
     staged_indexes = {index for cohort in cohorts for index, _merge in cohort}
 
-    for row in range(len(block.rows)):
+    for row in range(rows):
         for cohort in (item for item in cohorts if item[0][1].row == row):
             last_row = max(merge.row + merge.row_span - 1 for _index, merge in cohort)
             for horizontal_row in range(row, last_row + 1):
@@ -244,20 +294,31 @@ def _merge_commands(block: TableBlock) -> tuple[NativeActionCommand, ...]:
                     horizontal_merges,
                     key=lambda item: -item.column,
                 ):
-                    anchor = cell_address(horizontal_row, merge.column)
-                    endpoint = cell_address(
+                    anchor = _live_address(horizontal_row, merge.column)
+                    endpoint = _live_address(
                         horizontal_row,
                         merge.column + merge.column_span - 1,
                     )
                     commands.extend(
                         (MergeCommand(anchor, endpoint), CellCommand(anchor))
                     )
+                    # 코호트가 쪼갠 가로 병합도 실제 표를 바꾼다. 장부를 여기서
+                    # 갱신하지 않으면 같은 코호트의 세로 앵커와 그 뒤 비-코호트
+                    # 병합이 이미 흡수된 주소를 다시 발행한다.
+                    _absorb(
+                        TableMerge(
+                            row=horizontal_row,
+                            column=merge.column,
+                            row_span=1,
+                            column_span=merge.column_span,
+                        )
+                    )
             for merge in sorted(
                 (merge for _index, merge in cohort),
                 key=lambda item: (-item.column, item.row),
             ):
-                anchor = cell_address(merge.row, merge.column)
-                endpoint = cell_address(
+                anchor = _live_address(merge.row, merge.column)
+                endpoint = _live_address(
                     merge.row + merge.row_span - 1,
                     merge.column,
                 )
@@ -265,14 +326,7 @@ def _merge_commands(block: TableBlock) -> tuple[NativeActionCommand, ...]:
                 commands.extend(
                     cell_format_commands(block.rows[merge.row][merge.column])
                 )
-                # 코호트로 묶었다고 압축이 사라지지는 않는다. 같은 사각형이
-                # 고립되면 아래 row_merges 경로가 이 장부를 갱신하는데, 코호트
-                # 경로가 갱신을 빠뜨리면 같은 행을 덮는 비-코호트 병합이 낡은
-                # 주소로 엉뚱한 셀을 합친다(주소는 유효해 조용히 어긋난다).
-                for row_offset in range(merge.row_span):
-                    row_anchors = anchors[merge.row + row_offset]
-                    for column_offset in range(1, merge.column_span):
-                        row_anchors.remove(merge.column + column_offset)
+                _absorb(merge)
 
         row_merges = (
             merge
@@ -293,11 +347,7 @@ def _merge_commands(block: TableBlock) -> tuple[NativeActionCommand, ...]:
             )
             commands.extend((MergeCommand(anchor, endpoint), CellCommand(anchor)))
             commands.extend(cell_format_commands(block.rows[merge.row][merge.column]))
-            if merge.row_span > 1:
-                for row_offset in range(merge.row_span):
-                    row_anchors = anchors[merge.row + row_offset]
-                    for column_offset in range(1, merge.column_span):
-                        row_anchors.remove(merge.column + column_offset)
+            _absorb(merge)
     return tuple(commands)
 
 
@@ -374,48 +424,47 @@ def table_commands(
         "plan_trail_mm",
     }
     explicit_paragraph_fields = paragraph_fields.intersection(block.model_fields_set)
-    paragraph = (
-        paragraph_command(
-            ParagraphFormatting(
-                alignment=(
-                    block.alignment
-                    if "alignment" in explicit_paragraph_fields
-                    else "inherit"
-                ),
-                left_mm=(
-                    block.left_margin_mm
-                    if "left_margin_mm" in explicit_paragraph_fields
-                    else None
-                ),
-                right_mm=(
-                    block.right_margin_mm
-                    if "right_margin_mm" in explicit_paragraph_fields
-                    else None
-                ),
-                indentation_mm=(
-                    block.indentation_mm
-                    if "indentation_mm" in explicit_paragraph_fields
-                    else None
-                ),
-                before_mm=(
-                    block.plan_lead_mm
-                    if "plan_lead_mm" in explicit_paragraph_fields
-                    else None
-                ),
-                after_mm=(
-                    block.plan_trail_mm
-                    if "plan_trail_mm" in explicit_paragraph_fields
-                    else None
-                ),
-                line_spacing=(
-                    plan_lead_line_spacing(block.plan_lead_mm)
-                    if "plan_lead_mm" in explicit_paragraph_fields
-                    else None
-                ),
-            )
+    paragraph = paragraph_command(
+        ParagraphFormatting(
+            # Applying a base style does not clear inherited numbering.
+            # The table anchor is a body paragraph; captions own their numbering.
+            heading_type=0,
+            alignment=(
+                block.alignment
+                if "alignment" in explicit_paragraph_fields
+                else "inherit"
+            ),
+            left_mm=(
+                block.left_margin_mm
+                if "left_margin_mm" in explicit_paragraph_fields
+                else None
+            ),
+            right_mm=(
+                block.right_margin_mm
+                if "right_margin_mm" in explicit_paragraph_fields
+                else None
+            ),
+            indentation_mm=(
+                block.indentation_mm
+                if "indentation_mm" in explicit_paragraph_fields
+                else None
+            ),
+            before_mm=(
+                block.plan_lead_mm
+                if "plan_lead_mm" in explicit_paragraph_fields
+                else None
+            ),
+            after_mm=(
+                block.plan_trail_mm
+                if "plan_trail_mm" in explicit_paragraph_fields
+                else None
+            ),
+            line_spacing=(
+                plan_lead_line_spacing(block.plan_lead_mm)
+                if "plan_lead_mm" in explicit_paragraph_fields
+                else None
+            ),
         )
-        if explicit_paragraph_fields
-        else None
     )
     if paragraph is not None:
         commands.append(paragraph)
@@ -464,7 +513,7 @@ def table_commands(
     if block.row_heights_mm is not None and any(
         cell.text or cell.paragraphs for cells in block.rows for cell in cells
     ):
-        commands.extend(_geometry_commands(block))
+        commands.extend(_geometry_commands(block, include_columns=False))
     commands.extend(_merge_commands(block))
     if block.caption is not None:
         caption_style = _style_id(

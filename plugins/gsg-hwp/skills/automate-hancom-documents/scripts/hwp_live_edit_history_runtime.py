@@ -486,6 +486,15 @@ def document_checkpoint_unavailable_reason(candidate: HwpDocumentCandidate) -> s
     return ""
 
 
+def full_document_checkpoint_unavailable_reason(candidate: HwpDocumentCandidate) -> str:
+    if os.environ.get("HWP_FULL_DOCUMENT_CHECKPOINTS") != "1":
+        return (
+            "전체 문서 체크포인트 자동 저장을 생략했습니다. "
+            "이 편집은 한/글 되돌리기(Ctrl+Z)를 사용하세요."
+        )
+    return document_checkpoint_unavailable_reason(candidate)
+
+
 def _control_state(
     controls: tuple[NativePageControl, ...],
 ) -> tuple[PageControlSnapshot, ...]:
@@ -1647,7 +1656,7 @@ def _execute_checkpointed_text_patch(
     unsafe_selectors: set[str],
     guard: Callable[[], None],
 ) -> TextPatchResult:
-    unavailable = document_checkpoint_unavailable_reason(candidate)
+    unavailable = full_document_checkpoint_unavailable_reason(candidate)
     if unavailable:
         # No checkpoint may be taken: either two copies will not fit the
         # session's disk history, or 한/글 has already proved it cannot sign
@@ -1862,7 +1871,7 @@ def execute_managed_layout_edit(
     `recovery` instead, which is a fact rather than a request.
     """
     _ = require_undo_entry
-    unavailable = document_checkpoint_unavailable_reason(candidate)
+    unavailable = full_document_checkpoint_unavailable_reason(candidate)
     if unavailable:
         if recovery is not None:
             recovery.unavailable_reason = unavailable

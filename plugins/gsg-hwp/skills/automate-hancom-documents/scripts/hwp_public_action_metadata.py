@@ -58,7 +58,9 @@ HWP_EDIT_PICTURE_DESCRIPTION: Final = (
     "줍니다. 응답의 picture에는 원본 크기와 실제로 적용된 자르기가 함께 들어 있습니다."
 )
 HWP_RESTRUCTURE_TABLE_DESCRIPTION: Final = (
-    "사진 표의 열 수 변경·재배치를 한 호출로 수행합니다. 원본 표 바로 옆에 최종 표를 "
+    "사진과 사진 라벨로만 구성된 표의 열 수 변경·재배치 전용입니다. "
+    "이미 나뉜 제목 칸 입력은 hwp_fill_table을 사용합니다. "
+    "매핑에서 누락된 본문이 있으면 해당 셀을 반환합니다. 원본 표 바로 옆에 최종 표를 "
     "만들고 사진을 한/글 자체 Copy/Paste로 직접 무손실 복사하므로 원본 내장 바이트를 "
     "재인코딩하지 않습니다. 사진 수·개체 ID·크기와 라벨·캡션을 전량 검증한 뒤에만 "
     "원본 표를 삭제하며, 문서 끝에 임시 표를 만들지 않습니다. 기본 사진 격자는 "
@@ -72,14 +74,19 @@ HWP_COPY_PICTURE_DESCRIPTION: Final = (
     "mm로 정하며 이미지 바이트는 재인코딩하지 않습니다. 대상은 target_id 또는 "
     "table_id와 cell로 지목하고, 목적지는 to_cell과 필요하면 to_table_id로 지목합니다."
 )
-HWP_ADD_CAPTION_DESCRIPTION: Final = "현재 선택했거나 hwp_inspect_page_fast가 반환한 instance_id 또는 앞선 후보 target_id로 표·그림의 캡션을 추가하거나 기존 캡션을 같은 문서 서식으로 갱신합니다. 기존 캡션을 편집할 때 리터럴 텍스트만 제거하고 자동 번호 필드는 보존하며 atno 개수 불변을 강제하는 안전 도구입니다. 대상이 여러 개면 실제 후보를 반환합니다."
+HWP_ADD_CAPTION_DESCRIPTION: Final = "표·그림 개체에 부착하는 캡션을 명시적으로 요청했을 때만 사용합니다. 본문 문단으로 된 표·그림 제목은 올바른 같은 종류 제목을 원본으로 hwp_apply_style의 source_position과 style_copy_type=2로 글자·문단 모양을 복사하고 제목 문구만 바꾸세요. 번호를 직접 입력하지 마세요. 별도 제목과 개체 부착 캡션이 중복되면 숨은 번호 때문에 순서가 건너뛸 수 있으므로 구조와 앞뒤 번호를 확인하세요. 현재 선택 또는 실제 instance_id/target_id의 부착 캡션을 추가·갱신하며 기존 자동 번호 필드를 보존합니다."
 HWP_APPLY_STYLE_DESCRIPTION: Final = (
-    "현재 선택 영역에 문서 스타일 ID를 적용합니다. "
+    "문서 style_id를 적용하거나 source_position의 실제 모양을 target_position에 복사합니다. "
+    "style_id와 source_position은 함께 쓰지 않습니다. style_copy_type은 0 글자, 1 문단, "
+    "2 글자와 문단(기본값), 3 글자 스타일, 4 문단 스타일입니다. "
     "개별 글자·문단 속성을 지정하는 요청은 hwp_format_text를 사용합니다."
 )
 HWP_FORMAT_TEXT_DESCRIPTION: Final = (
     "현재 선택 영역에 지정한 글자·문단 서식을 적용합니다. "
-    "표 셀 서식은 hwp_format_table을 사용합니다."
+    "letter_spacing_percent는 자간의 절대 백분율(-50~50)이며, 생략하면 유지합니다. "
+    "본문과 표 안의 일부 글자는 target range와 expected_text로 좁혀 조정합니다. "
+    "단어 끊김 보정은 필요한 줄의 구간만 소폭 조정한 뒤 hwp_render_page로 앞뒤 줄을 확인하세요. "
+    "표 셀 전체의 기타 서식은 hwp_format_table을 사용합니다."
 )
 HWP_PATCH_TEXT_DESCRIPTION: Final = (
     "선택 여부와 무관하게 현재 커서·현재 선택·명시 범위·문서 검색 결과·정확한 표 셀의 텍스트를 "
@@ -101,6 +108,10 @@ HWP_PATCH_TEXT_BATCH_DESCRIPTION: Final = (
     "공통 적용되며 각 교체·서식을 다음 패치 전에 즉시 되읽어 검증합니다. 항목별 formatting은 "
     "받지 않습니다. expected_text는 문서 구조의 리터럴 텍스트이며 화면에 보이는 자동 "
     "번호·글머리표(예: 가), ◦)는 제외합니다. 실제 리터럴 문자는 자동 제거하지 않습니다."
+    " format_changed_only=true는 같은 문단의 expected_text/replacement를 공백으로 구분된 "
+    "토큰별 RANGE로 좁혀 바뀐 단어·숫자만 공통 서식으로 적용합니다. 바뀐 표 셀은 셀 전체에 "
+    "적용하고 같은 값의 항목은 생략합니다. 이 모드는 formatting과 모든 expected_text가 필요하며 "
+    "정확한 같은 문단 RANGE 또는 table_cell 대상만 받습니다."
 )
 HWP_REPLACE_SELECTED_TEXT_DESCRIPTION: Final = (
     "현재 사용자가 드래그한 선택 영역의 전체 텍스트를 지정한 문자열로 교체합니다. "

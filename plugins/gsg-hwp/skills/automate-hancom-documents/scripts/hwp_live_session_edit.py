@@ -61,7 +61,15 @@ class LiveHwpEditSession(LiveHwpInspectionSession):
         request: TextPatchRequest,
     ) -> TextPatchResult:
         candidate, hwp = self._validate(session_id)
-        if request.formatting is not None and request.target.kind != "current":
+        if (
+            request.formatting is not None
+            and request.formatting.letter_spacing_percent is None
+            and request.formatting.left_margin_mm is None
+            and request.formatting.indentation_mm is None
+            and request.formatting.keep_with_next is None
+            and request.formatting.page_break_before is None
+            and request.target.kind != "current"
+        ):
             # A format-only patch is a one-target prepared transaction. It captures
             # only requested prior format values and records native inverses; no
             # document-file checkpoint belongs on this public formatting route.
@@ -80,6 +88,9 @@ class LiveHwpEditSession(LiveHwpInspectionSession):
                 self._unsafe_selectors,
                 self._guard(candidate, hwp),
             )
+        # Spacing uses the single, checkpoint-aware route: the loaded bridge
+        # verifies all seven Spacing* setters, but prepared inverse receipts do
+        # not contain those properties. Do not misreport a batch as undoable.
         return execute_managed_text_patch(
             hwp,
             candidate,

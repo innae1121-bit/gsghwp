@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from hwp_reference_image_artifacts import save_text_crop
+from hwp_reference_image_artifacts import ARTIFACT_IMAGE_SUFFIX, save_text_crop
 from hwp_reference_image_contract import (
     AnalysisAxis,
     BreakpointSource,
@@ -119,7 +119,7 @@ def compile_texts(
     result: list[ReferenceTextRegion] = []
     for bbox in regions:
         region_id = _stable_id("txt", version, image_hash, bbox)
-        crop_path = directory / f"{region_id}.png"
+        crop_path = directory / f"{region_id}{ARTIFACT_IMAGE_SUFFIX}"
         crop_hash = save_text_crop(canvas, bbox=bbox, path=crop_path)
         result.append(
             ReferenceTextRegion(

@@ -40,6 +40,7 @@ struct Context {
     std::wstring tableId;
     std::wstring currentCell;
     hancom::inspection::CellTopology topology;
+    bool reuseTextPatchTopology = false;
     hancom::formatting::ParagraphFormat copiedTableAnchorFormat;
     bool hasCopiedTableAnchorFormat = false;
     std::wstring copiedTableBlock;

@@ -50,7 +50,8 @@ from hwp_live_native_events import HybridChangeSignal
 from hwp_live_native_action_contract import NativeActionFailure
 from hwp_live_native_batch import (
     forget_cached_content_signatures,
-    forget_content_signature_refusals,
+    forget_content_signature_refusals_on_rebind,
+    load_persisted_refusals_once,
     native_dispatch_operation_scope,
     note_native_window_content_change,
 )
@@ -2079,7 +2080,45 @@ class HancomBridge(
         # A rebind is the one moment the worker stops knowing which document a
         # window holds, so the remembered "the engine cannot serialise this"
         # stops being about anything. Writes deliberately do not clear it.
-        forget_content_signature_refusals()
+        #
+        # The window being activated is what is passed: the durable ledger is
+        # shared by every worker on this machine, and clearing all of it from
+        # here deleted the memory of processes servicing other 한/글 instances.
+        # Memory is still cleared whole -- forgetting too much in this process
+        # only costs this process an engine attempt.
+        forget_content_signature_refusals_on_rebind(connected.document.window_handle)
+        # ...but the first activation of a window is not a rebind: there was no
+        # document this worker had bound in it and now stopped knowing. That is
+        # the one moment a previous worker's durable refusal may be adopted, and
+        # this is the once-per-window call that does it. Every later activation
+        # of the same window is a real rebind and clears memory and that
+        # window's entry together (the window set inside
+        # ``forget_content_signature_refusals_on_rebind`` is what tells them
+        # apart).
+        #
+        # Only this window's entry is read and judged. ``_batch_for_window``
+        # (hwp_live_native_batch.py :1615) turns a handle into a dispatch for
+        # whatever process ``GetWindowThreadProcessId`` names, so judging the
+        # whole ledger from here sent a revision-token read into 한/글
+        # instances this worker never bound, and dropped their entry on a
+        # mismatch. Their entries are judged by their own worker's activation,
+        # under this same rule.
+        #
+        # The answer does not move, because an entry is adopted only onto the
+        # document it was measured on: the durable copy carries the session tag
+        # and the revision token's two hashes, and anything but a full match --
+        # a swapped document, a restarted 한/글, an edit since, an unreadable
+        # token -- drops the entry and adopts nothing, leaving the engine to be
+        # asked exactly as before. What is saved is the case where the document
+        # really is untouched: today's first edit after a worker restart spends
+        # the 17.2s serialisation attempt to be told it is unsignable, where
+        # this spends the 0.024s revision token and returns the same empty
+        # signature with the same notice. Why identity has to be proved here,
+        # and may not be inferred from size, is on
+        # ``load_persisted_refusals_once``.
+        #
+        # It cannot raise: warming a cache must never fail an activation.
+        _ = load_persisted_refusals_once(connected.document.window_handle)
         window = self._windows.read(connected.document.window_handle)
         session_id = connected.session_id
         with self._lifecycle_lock:
@@ -2470,13 +2509,10 @@ class HancomBridge(
             raise HwpLiveError("한컴 팝업 핸들은 1 이상이어야 합니다")
         if control_id < -1 or control_id > 65_535:
             raise HwpLiveError("한컴 팝업 control_id는 -1~65535여야 합니다")
-        return self._call(
-            lambda: self._windows.invoke_dialog_action(
-                dialog_window_handle,
-                control_id,
-            ),
-            process_id=self._bridge_process_id(dialog_window_handle),
-        )
+        # A modal dialog may be blocking the document COM lane itself. The
+        # bounded popup reader revalidates the exact control before delivery;
+        # queuing that recovery action behind document COM would deadlock it.
+        return self._windows.invoke_dialog_action(dialog_window_handle, control_id)
 
     def dismiss_dialogs(self, window_handle: int) -> HancomDialogDismissResult:
         if window_handle < 1:

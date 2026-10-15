@@ -259,12 +259,16 @@ class LiveHwpInspectionSession(LiveHwpSessionCore):
         )
         if cached.profile is not None:
             profile = cached.profile
+            # 적중은 미스와 같은 답을 내야 한다. 스타일별 관측(글꼴·크기·글머리
+            # ·대표 문단)은 관례 프로필에 접혀 있지 않으므로 캐시가 따로 실어
+            # 둔 목록을 그대로 돌려주고, 완전성도 저장 당시의 값을 쓴다.
             return styles.model_copy(
                 update={
                     "observed_usage": DocumentStyleObservation(
                         scanned_paragraphs=profile.scanned_paragraphs,
                         counted_paragraphs=profile.counted_paragraphs,
-                        complete=profile.complete,
+                        complete=cached.styles_complete,
+                        styles=cached.styles,
                         convention_profile=profile,
                     )
                 }
@@ -299,7 +303,12 @@ class LiveHwpInspectionSession(LiveHwpSessionCore):
         profile = observed.convention_profile
         metadata = cached.metadata
         if not modified and allow_historical_convention:
-            stored = self._convention_cache.store(Path(candidate.full_name), profile)
+            stored = self._convention_cache.store(
+                Path(candidate.full_name),
+                profile,
+                styles=observed.styles,
+                styles_complete=observed.complete,
+            )
             metadata = metadata.model_copy(update={"created_at": stored.created_at})
         return observed_styles.model_copy(
             update={

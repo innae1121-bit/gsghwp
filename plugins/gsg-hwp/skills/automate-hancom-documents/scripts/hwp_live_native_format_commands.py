@@ -54,6 +54,7 @@ FORMAT_TOPOLOGY_WORK_BUDGET: Final = FORMAT_COMMAND_BUDGET * 100
 @dataclass(frozen=True, slots=True)
 class TextFormatCommandPlan:
     formatting: TextFormatSpec
+    whole_body: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +202,7 @@ _TOPOLOGY_PRESERVING_PARAMETER_ACTIONS: Final = frozenset(
         ("ParagraphShape", "HParaShape"),
         ("CellFill", "HCellBorderFill"),
         ("CellBorder", "HCellBorderFill"),
+        ("CellBorderFill", "HCellBorderFill"),
     }
 )
 _TOPOLOGY_PRESERVING_RUN_ACTIONS: Final = frozenset(
@@ -282,15 +284,35 @@ def _cell_range_commands(
     target: CellRangeTarget,
     geometry_commands: tuple[NativeActionCommand, ...],
 ) -> tuple[NativeActionCommand, ...]:
-    return (
+    selection = (
         CellCommand(target.anchor),
         RunCommand("TableCellBlock"),
         RunCommand("TableCellBlockExtend"),
         *(RunCommand("TableRightCell") for _ in range(target.right_steps)),
         *(RunCommand("TableLowerCell") for _ in range(target.down_steps)),
-        *geometry_commands,
-        RunCommand("Cancel"),
     )
+    return _selected_cell_format_commands(selection, geometry_commands)
+
+
+def _selected_cell_format_commands(
+    selection: tuple[NativeActionCommand, ...],
+    formatting: tuple[NativeActionCommand, ...],
+) -> tuple[NativeActionCommand, ...]:
+    # CharShape/ParagraphShape may leave a text-format selection context even
+    # when HWP still reports selection mode 3. Re-enter the same physical block
+    # before a cell-format action; otherwise CellFill can retain the old fill.
+    commands = list(selection)
+    text_context = False
+    for command in formatting:
+        is_text = isinstance(command, ParameterActionCommand) and (
+            command.action in {"CharShape", "ParagraphShape", "Style"}
+        )
+        if text_context and not is_text:
+            commands.extend((RunCommand("Cancel"), *selection))
+        commands.append(command)
+        text_context = is_text
+    commands.append(RunCommand("Cancel"))
+    return tuple(commands)
 
 
 def _table_format_groups(
@@ -351,11 +373,9 @@ def _table_format_groups(
         # regions keep one explicitly selected block per physical cell.
         if not plan.cell_geometry_targets:
             for index, cell in enumerate(cells):
-                commands = (
-                    CellCommand(cell),
-                    RunCommand("TableCellBlock"),
-                    *cell_commands,
-                    RunCommand("Cancel"),
+                commands = _selected_cell_format_commands(
+                    (CellCommand(cell), RunCommand("TableCellBlock")),
+                    cell_commands,
                 )
                 groups.append(
                     NativeFormatCommandGroup(
@@ -491,9 +511,18 @@ def build_native_format_commands(
         return tuple(
             command
             for command in (
-                character_command(character),
+                character_command(
+                    character, letter_spacing_percent=text.letter_spacing_percent
+                ),
                 paragraph_command(
-                    ParagraphFormatting(text.alignment, text.line_spacing)
+                    ParagraphFormatting(
+                        text.alignment,
+                        line_spacing=text.line_spacing,
+                        left_mm=text.left_margin_mm,
+                        indentation_mm=text.indentation_mm,
+                        keep_with_next=text.keep_with_next,
+                        page_break_before=text.page_break_before,
+                    )
                 ),
             )
             if command is not None

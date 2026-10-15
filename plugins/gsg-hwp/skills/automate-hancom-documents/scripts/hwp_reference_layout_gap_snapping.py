@@ -16,6 +16,7 @@ from hwp_reference_layout_gap_topology import (
     text_blocked_cells,
 )
 from hwp_reference_layout_image_evidence import (
+    LayoutLines,
     ProjectionLine,
     detect_layout_lines_from_image,
 )
@@ -104,8 +105,15 @@ def snap_column_gap_breakpoints(
     block: ReferenceLayoutBlock,
     row_breakpoints: tuple[float, ...],
     column_breakpoints: tuple[float, ...],
+    layout_lines: LayoutLines | None = None,
 ) -> tuple[float, ...]:
-    _, candidates = detect_layout_lines_from_image(image)
+    # layout_lines 를 받으면 같은 이미지의 투영을 다시 돌지 않는다 —
+    # snap_layout_breakpoints_from_image 의 같은 인자와 짝이다.
+    _, candidates = (
+        detect_layout_lines_from_image(image)
+        if layout_lines is None
+        else layout_lines
+    )
     pairs = _candidate_pairs(candidates)
     if not pairs:
         return column_breakpoints

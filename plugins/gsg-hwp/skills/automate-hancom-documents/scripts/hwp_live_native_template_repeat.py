@@ -188,19 +188,21 @@ class NativeCaptionProfile:
     display_number: int | None = None
 
 
-def _delete_row_command() -> ParameterActionCommand:
-    return ParameterActionCommand(
-        "TableDeleteRow",
-        "HTableDeleteLine",
-        (NativeSetter("Type", IntegerValue(0)),),
-    )
-
-
-def table_copy_content_commands(block: NativeTableCopy) -> tuple[NativeActionCommand, ...]:
+def table_copy_content_commands(
+    block: NativeTableCopy,
+) -> tuple[NativeActionCommand, ...]:
     commands: list[NativeActionCommand] = []
     if block.delete_rows_from is not None:
-        commands.append(CellCommand(block.delete_rows_from))
-        commands.extend(_delete_row_command() for _ in range(block.delete_row_count))
+        commands.extend(
+            (
+                CellCommand(block.delete_rows_from),
+                RunCommand("TableCellBlock"),
+                RunCommand("TableCellBlockExtend"),
+                RunCommand("TableColPageDown"),
+                RunCommand("TableColEnd"),
+                RunCommand("TableDeleteCell"),
+            )
+        )
     for cell in block.text_cells:
         commands.append(CellCommand(cell.address))
         if cell.replace:
@@ -328,7 +330,10 @@ def clone_table_after_source_commands(
         commands.extend((RunCommand("BreakPage"), PasteTableCommand()))
         if caption_title is not None and caption_profile is not None:
             assert style_transfer is not None
-            if not caption_profile.automatic_number or caption_profile.display_number is None:
+            if (
+                not caption_profile.automatic_number
+                or caption_profile.display_number is None
+            ):
                 raise HwpLiveError("원본 표 캡션의 표시 자동번호를 읽지 못했습니다")
             commands.extend(
                 _recreate_numbered_current_caption_commands(

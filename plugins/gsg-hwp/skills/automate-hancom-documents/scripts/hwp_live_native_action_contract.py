@@ -315,7 +315,41 @@ def _command_lines(command: NativeActionCommand) -> tuple[str, ...]:
             cell_address=cell_address,
             preserve_format=preserve_format,
             preflight_only=preflight_only,
+            literal_range=literal_range,
         ):
+            if literal_range is not None:
+                text = literal_range.paragraph_text.encode("utf-16-le")
+                left, right = literal_range.start, literal_range.end
+                if (
+                    not preflight_only
+                    or target != "range"
+                    or start is None
+                    or end is None
+                    or (start.list_id, start.paragraph) != (end.list_id, end.paragraph)
+                    or not 0 <= left < right <= len(text) // 2
+                    or "\r" in literal_range.paragraph_text
+                    or "\n" in literal_range.paragraph_text
+                    or expected is None
+                    or text[2 * left : 2 * right] != expected.encode("utf-16-le")
+                ):
+                    raise HwpLiveError(
+                        "inspected literal range requires read-only preparation"
+                    )
+                return (
+                    "\t".join(
+                        (
+                            "PREPARE_TEXT",
+                            "LITERAL_RANGE",
+                            str(start.list_id),
+                            str(start.paragraph),
+                            str(left),
+                            str(right),
+                            _encode(literal_range.paragraph_text),
+                            _encode(expected),
+                            _encode(replacement),
+                        )
+                    ),
+                )
             if target == "current":
                 if any(
                     value is not None

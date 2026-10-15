@@ -193,6 +193,15 @@ def _border_command(borders: CellBorders | None) -> ParameterActionCommand | Non
     for side, color_name, border in sides:
         if border is None:
             continue
+        if border.style == "none":
+            # HWP ignores a missing line's colour/width; requesting those too
+            # makes the native readback reject a correctly removed border.
+            setters.append(
+                NativeSetter(
+                    f"HSet/BorderType{side}", EnumerationValue("HwpLineType", "None")
+                )
+            )
+            continue
         setters.extend(
             (
                 NativeSetter(
@@ -211,7 +220,12 @@ def _border_command(borders: CellBorders | None) -> ParameterActionCommand | Non
     if not setters:
         return None
     return ParameterActionCommand(
-        action="CellBorder",
+        # CellBorder's GetDefault readback aggregates a block and can report
+        # the neighbouring line instead of the changed physical side. The
+        # border/fill action supports the same side parameters directly.
+        action="CellBorderFill"
+        if any(border is None or border.style == "none" for _, _, border in sides)
+        else "CellBorder",
         parameter_set="HCellBorderFill",
         setters=tuple(setters),
     )

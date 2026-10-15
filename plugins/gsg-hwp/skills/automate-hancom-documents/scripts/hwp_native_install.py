@@ -14,6 +14,7 @@ from ctypes import (
 import os
 import re
 import shutil
+import sys
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -31,9 +32,14 @@ from winreg import (
 )
 
 from hwp_errors import HwpLiveError
+from hwp_native_registration_desktop import (
+    DesktopRegistrationResult,
+    NativeBridgeRegistration as NativeBridgeRegistration,
+    register_native_bridge_on_desktop,
+)
 
 
-NATIVE_BRIDGE_VERSION = "0.5.176"
+NATIVE_BRIDGE_VERSION = "0.5.180"
 MODULE_NAME = "한컴브릿지"
 MODULES_KEY = r"Software\HNC\HwpUserAction\Modules"
 USES_KEY = rf"{MODULES_KEY}\Uses"
@@ -56,13 +62,6 @@ BRIDGE_MODULE_PREFIX: Final = "hancomlivebridge"
 _VERSION_PATTERN: Final = re.compile(r"\d+(?:\.\d+)+")
 _DIGEST_CACHE_LIMIT: Final = 32
 _DIGEST_CACHE: Final[dict[tuple[str, int, int], str]] = {}
-
-
-@dataclass(frozen=True, slots=True)
-class NativeBridgeRegistration:
-    path: Path
-    copied: bool
-    registered_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,6 +258,42 @@ def ensure_native_bridge_registered(
     package_root: Path | None = None,
     local_app_data: Path | None = None,
 ) -> NativeBridgeRegistration:
+    registration = install_native_bridge_current_process(
+        package_root=package_root, local_app_data=local_app_data
+    )
+    if local_app_data is None and os.environ.get(
+        "CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY"
+    ):
+        # Codex descendants can inherit an MSIX registry silo without package
+        # identity. Their HKCU value is not what Explorer-launched Hangul reads.
+        registration = register_native_bridge_on_desktop(
+            Path(__file__).parents[3] if package_root is None else package_root
+        )
+        # Keep Codex-launched Hangul in sync too, preserving the no-downgrade rule.
+        _ = _register_native_bridge(registration.registered_path or registration.path)
+    return registration
+
+
+def verify_native_bridge_registration(registration: NativeBridgeRegistration) -> None:
+    expected = registration.registered_path or registration.path
+    if registered_native_bridge_path() != expected:
+        raise HwpLiveError(
+            "일반 한컴용 브리지 DLL 등록 경로의 되읽기 검증이 실패했습니다"
+        )
+    with CreateKeyEx(HKEY_CURRENT_USER, USES_KEY, 0, KEY_QUERY_VALUE) as uses:
+        enabled, value_type = _read_registry_value(uses, MODULE_NAME)
+    if enabled != 1 or value_type != REG_DWORD:
+        raise HwpLiveError(
+            "일반 한컴용 브리지 활성화 등록의 되읽기 검증이 실패했습니다"
+        )
+
+
+def install_native_bridge_current_process(
+    *,
+    package_root: Path | None = None,
+    local_app_data: Path | None = None,
+) -> NativeBridgeRegistration:
+    """Install in this process's registry view; also used by the desktop helper."""
     source = packaged_native_bridge_path(package_root)
     if not source.is_file():
         raise HwpLiveError(f"패키지 네이티브 한컴 브리지 DLL이 없습니다: {source}")
@@ -476,3 +511,24 @@ def scan_loaded_native_bridges() -> LoadedBridgeScan:
             continue
         modules.extend(found)
     return LoadedBridgeScan(processes, tuple(modules), tuple(unreadable), None)
+
+
+def write_desktop_registration_result(package_root: Path, result_path: Path) -> None:
+    try:
+        # Do not dispatch another helper, even if the host inherited an env flag.
+        registration = install_native_bridge_current_process(package_root=package_root)
+        verify_native_bridge_registration(registration)
+        result = DesktopRegistrationResult(registration=registration)
+    except Exception as error:
+        result = DesktopRegistrationResult(error=str(error))
+    temporary = result_path.with_suffix(".tmp")
+    _ = temporary.write_text(result.model_dump_json(), encoding="utf-8")
+    _ = temporary.replace(result_path)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 4 or sys.argv[1] != "--register-desktop":
+        raise SystemExit(
+            "usage: hwp_native_install.py --register-desktop PACKAGE_ROOT RESULT"
+        )
+    write_desktop_registration_result(Path(sys.argv[2]), Path(sys.argv[3]))

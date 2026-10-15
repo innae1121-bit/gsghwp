@@ -9,6 +9,46 @@ from hwp_reference_image_contract import NormalizedBox, ReferenceImageTile
 from hwp_reference_image_pixels import PixelBox, PixelCanvas, PixelGap, PixelObject, PixelSegment
 
 
+# 산출 그림의 형식은 여기 한 곳에서 정한다. PNG 로 내면 삽입용 크롭이 그대로
+# .hwp 안에 들어가 문서가 붓는다 — 형식·품질을 바꿀 일이 생기면 이 상수만
+# 고치면 일곱 저장 지점이 함께 따라온다.
+ARTIFACT_IMAGE_FORMAT = "JPEG"
+ARTIFACT_IMAGE_SUFFIX = ".jpg"
+ARTIFACT_IMAGE_QUALITY = 95
+ARTIFACT_IMAGE_SUBSAMPLING = 0
+
+
+def _write_artifact_image(image: Image.Image, path: Path) -> None:
+    image.save(
+        path,
+        format=ARTIFACT_IMAGE_FORMAT,
+        quality=ARTIFACT_IMAGE_QUALITY,
+        subsampling=ARTIFACT_IMAGE_SUBSAMPLING,
+        optimize=False,
+    )
+
+
+def save_artifact_image(image: Image.Image, path: Path) -> None:
+    """산출 그림을 JPEG 로 쓴다.
+
+    JPEG 는 투명도를 담지 못한다 — 알파가 붙은 원본을 그대로 넘기면 저장이
+    실패하거나 투명한 자리가 검정으로 굳는다. 그래서 알파가 있으면 흰 배경에
+    합성한 뒤 저장한다. 문서 배경이 흰색이라 합성 결과가 곧 삽입된 뒤 보일
+    그림이다.
+    """
+    if image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info:
+        with image.convert("RGBA") as rgba:
+            with Image.new("RGB", rgba.size, (255, 255, 255)) as flattened:
+                flattened.paste(rgba, mask=rgba.getchannel("A"))
+                _write_artifact_image(flattened, path)
+        return
+    if image.mode != "RGB":
+        with image.convert("RGB") as converted:
+            _write_artifact_image(converted, path)
+        return
+    _write_artifact_image(image, path)
+
+
 def _normalized(bbox: PixelBox, canvas: PixelCanvas) -> NormalizedBox:
     return NormalizedBox(
         left=bbox.left / canvas.width,
@@ -44,11 +84,11 @@ def save_tiles(
         start=1,
     ):
         bbox = PixelBox(left, top, left + tile_width, top + tile_height)
-        tile_path = directory / f"tile-{index:04d}.png"
+        tile_path = directory / f"tile-{index:04d}{ARTIFACT_IMAGE_SUFFIX}"
         with canvas.image.crop(
             (bbox.left, bbox.top, bbox.right, bbox.bottom)
         ) as image:
-            image.save(tile_path, format="PNG", optimize=False)
+            save_artifact_image(image, tile_path)
             image_hash = hashlib.sha256(image.tobytes()).hexdigest()
         tiles.append(
             ReferenceImageTile(
@@ -104,8 +144,8 @@ def save_contact_sheets(
                     fill="black",
                     font=font,
                 )
-            path = directory / f"contact-sheet-{sheet_index:02d}.png"
-            sheet.save(path, format="PNG", optimize=False)
+            path = directory / f"contact-sheet-{sheet_index:02d}{ARTIFACT_IMAGE_SUFFIX}"
+            save_artifact_image(sheet, path)
         sheets.append(path)
     return tuple(sheets)
 
@@ -124,7 +164,7 @@ def save_text_crop(
             (crop.width * scale, crop.height * scale),
             resample=Image.Resampling.NEAREST,
         ) as enlarged:
-            enlarged.save(path, format="PNG", optimize=False)
+            save_artifact_image(enlarged, path)
         return hashlib.sha256(crop.tobytes()).hexdigest()
 
 
@@ -181,6 +221,6 @@ def save_overlay(
                 )
             draw.line(points, fill=(255, 25, 25, 255), width=max(2, segment.width))
         with overlay.convert("RGB") as flattened:
-            flattened.save(path, format="PNG", optimize=False)
+            save_artifact_image(flattened, path)
     finally:
         overlay.close()

@@ -394,7 +394,7 @@ _DESCRIPTORS: Final = (
             "table.format.v1",
             ("ResolveTable", "ApplyTableFormat", "VerifyStructure"),
         ),
-        ("hwp_format_table",),
+        ("hwp_format_table", "hwp_set_table_size_fixed"),
         ("native_operation_specific_readback",),
     ),
     OperationDescriptor(

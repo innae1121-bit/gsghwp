@@ -1540,11 +1540,16 @@ Error WalkParsedRecordStream(
   Sha256 priorBinaryDigest{};
   std::uint64_t priorBinaryLength = 0;
   while (true) {
+    // Producer-backed streams: sample completion before the length so a
+    // true completion always pairs with the final length. Sampling the
+    // length first can pair a stale length with a fresh completion and end
+    // the walk before the producer's tail records were consumed.
+    const bool producerComplete = stream.currentLength != nullptr &&
+        stream.complete != nullptr && stream.complete(stream.context);
     const std::uint64_t available = stream.currentLength != nullptr
         ? stream.currentLength(stream.context) : stream.length;
     if (offset == available &&
-        (stream.currentLength == nullptr ||
-         (stream.complete != nullptr && stream.complete(stream.context))))
+        (stream.currentLength == nullptr || producerComplete))
       break;
     std::array<std::uint8_t, 24> header{};
     if (stream.currentLength == nullptr &&

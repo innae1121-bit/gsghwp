@@ -1,39 +1,39 @@
 {
-    "name":  "gsg-hwp",
-    "version":  "1.6.2",
-    "description":  "열려 있는 한/글 문서를 에이전트에서 조회·편집·검수하고 참고 이미지를 편집 가능한 네이티브 레이아웃으로 재구성하는 Windows용 MCP 플러그인",
-    "author":  {
-                   "name":  "inodesign",
-                   "url":  "https://github.com/innae1121-bit"
-               },
-    "homepage":  "https://github.com/innae1121-bit/gsghwp",
-    "repository":  "https://github.com/innae1121-bit/gsghwp",
-    "keywords":  [
-                     "hancom",
-                     "hwp",
-                     "mcp",
-                     "native-automation",
-                     "korean"
-                 ],
-    "skills":  "./skills/",
-    "mcpServers":  "./.mcp.json",
-    "interface":  {
-                      "displayName":  "GSG HWP 한컴 자동화",
-                      "shortDescription":  "열린 HWP를 네이티브 방식으로 조회·편집·검수합니다.",
-                      "longDescription":  "Windows 한/글의 공식 Automation API와 C++/ATL UserAction 브리지를 연결해 현재 열린 문서의 표, 그림, 텍스트, 스타일과 구조를 빠르게 조회하고 안전하게 편집합니다. 참고 PDF·PPT·이미지의 제목·본문·표·캡션은 편집 가능한 한컴 네이티브 객체로 재구성하고 사진·도면만 그림으로 배치하며, 렌더 결과까지 검수합니다.",
-                      "developerName":  "inodesign",
-                      "category":  "Productivity",
-                      "capabilities":  [
-                                           "Interactive",
-                                           "Read",
-                                           "Write"
-                                       ],
-                      "websiteURL":  "https://github.com/innae1121-bit/gsghwp",
-                      "defaultPrompt":  [
-                                            "현재 열린 HWP의 구조와 표를 빠르게 확인해줘.",
-                                            "선택한 표에 데이터를 채우고 결과를 렌더링해 검수해줘.",
-                                            "현재 문서의 그림을 교체하고 배치를 확인해줘.",
-                                            "이 참고 이미지를 편집 가능한 한컴 네이티브 레이아웃으로 재구성해줘."
-                                        ]
-                  }
+  "name": "gsg-hwp",
+  "version": "1.7.0",
+  "description": "열려 있는 한/글 문서를 에이전트에서 조회·편집·검수하고 참고 이미지를 편집 가능한 네이티브 레이아웃으로 재구성하는 Windows용 MCP 플러그인",
+  "author": {
+    "name": "inodesign",
+    "url": "https://github.com/innae1121-bit"
+  },
+  "homepage": "https://github.com/innae1121-bit/gsghwp",
+  "repository": "https://github.com/innae1121-bit/gsghwp",
+  "keywords": [
+    "hancom",
+    "hwp",
+    "mcp",
+    "native-automation",
+    "korean"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "GSG HWP 한컴 자동화",
+    "shortDescription": "열린 HWP를 네이티브 방식으로 조회·편집·검수합니다.",
+    "longDescription": "Windows 한/글의 공식 Automation API와 C++/ATL UserAction 브리지를 연결해 현재 열린 문서의 표, 그림, 텍스트, 스타일과 구조를 빠르게 조회하고 안전하게 편집합니다. 참고 PDF·PPT·이미지의 제목·본문·표·캡션은 편집 가능한 한컴 네이티브 객체로 재구성하고 사진·도면만 그림으로 배치하며, 렌더 결과까지 검수합니다.",
+    "developerName": "inodesign",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/innae1121-bit/gsghwp",
+    "defaultPrompt": [
+      "현재 열린 HWP의 구조와 표를 빠르게 확인해줘.",
+      "선택한 표에 데이터를 채우고 결과를 렌더링해 검수해줘.",
+      "현재 문서의 그림을 교체하고 배치를 확인해줘.",
+      "이 참고 이미지를 편집 가능한 한컴 네이티브 레이아웃으로 재구성해줘."
+    ]
+  }
 }

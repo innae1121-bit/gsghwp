@@ -90,19 +90,25 @@ def _prepare_text(
             "선택 영역 target이 필요합니다",
             ("inputs.target",),
         )
-    if not before.selection.selected:
+    parameters = dict(request.parameters)
+    whole_body = parameters.pop("whole_body", False)
+    if not isinstance(whole_body, bool):
+        return InputFailure(
+            "schema_conflict", "whole_body는 true 또는 false여야 합니다"
+        )
+    if not before.selection.selected and not whole_body:
         return InputFailure(
             "needs_input",
             "서식을 적용할 텍스트 선택 영역이 없습니다",
             ("inputs.target",),
         )
-    parsed = parse_text_format(request.parameters)
+    parsed = parse_text_format(parameters)
     if isinstance(parsed, InputFailure):
         return parsed
     return PreparedFormatOperation(
-        TextFormatCommandPlan(parsed),
-        _selection_id(before.selection),
-        "target.selection",
+        TextFormatCommandPlan(parsed, whole_body=whole_body),
+        "document:text" if whole_body else _selection_id(before.selection),
+        "target.document" if whole_body else "target.selection",
         (),
     )
 

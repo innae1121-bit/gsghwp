@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from hwp_errors import HwpLiveError
 from hwp_image_fit import (
     cover_crop_in_box,
@@ -25,12 +27,14 @@ from hwp_live_native_action_models import (
     NativeSetter,
     ParameterActionCommand,
     PictureCrop,
+    RunCommand,
     SelectControlCommand,
     TextValue,
 )
 from hwp_live_native_batch import (
     inspect_native_page,
     inspect_native_structure,
+    read_native_paragraph_styles,
     read_native_snapshot,
 )
 from hwp_live_native_template_repeat import (
@@ -111,6 +115,58 @@ def _selection_snapshot(
     return snapshot
 
 
+def _numbered_shape(
+    candidate: HwpDocumentCandidate, snapshot: NativeSnapshot
+) -> NativeSnapshot:
+    scan = read_native_paragraph_styles(
+        candidate.window_handle,
+        list_id=snapshot.cursor.list_id,
+        start=snapshot.cursor.paragraph,
+        limit=1,
+        paragraph_shape=True,
+    )
+    if (
+        scan is None
+        or scan.document_id != snapshot.document_id
+        or scan.full_name != snapshot.full_name
+        or scan.list_id != snapshot.cursor.list_id
+    ):
+        return snapshot
+    observed = next(
+        (p for p in scan.paragraphs if p.paragraph == snapshot.cursor.paragraph), None
+    )
+    if observed is None or observed.heading_type is None:
+        return snapshot
+    return replace(
+        snapshot,
+        paragraph_format=replace(
+            snapshot.paragraph_format,
+            heading_type=observed.heading_type,
+            heading_level=observed.heading_level,
+            marker_is_automatic=observed.heading_type > 0,
+        ),
+    )
+
+
+def _verify_copied_shape(
+    source: NativeSnapshot, after: NativeSnapshot, copy_type: int
+) -> bool:
+    """Verify observed shape, including automatic paragraph-numbering status.
+
+    The display number is intentionally not compared: following paragraphs
+    must advance through HWP's sequence rather than inherit literal digits.
+    """
+    if copy_type not in (0, 1, 2) or not after.selection.selected:
+        return False
+    if copy_type in (0, 2) and source.character_format != after.character_format:
+        raise HwpLiveError("모양 복사 후 원본과 대상의 글자 모양이 일치하지 않습니다")
+    if copy_type in (1, 2) and source.paragraph_format != after.paragraph_format:
+        raise HwpLiveError(
+            "모양 복사 후 문단 모양 또는 자동번호 설정이 일치하지 않습니다"
+        )
+    return True
+
+
 def operate_object_recipe(
     candidate: HwpDocumentCandidate,
     hwp: LiveHwpApplication,
@@ -156,6 +212,9 @@ def operate_object_recipe(
     image_replace_expectation: PictureReplaceExpectation | None = None
     resolved_control_page: NativePageInspection | None = None
     style_expected_id: int | None = None
+    copied_shape_source: NativeSnapshot | None = None
+    shape_probe_commands = 0
+    shape_probe_elapsed = 0
     style_target_position: NativePosition | None = None
     style_verification_scope_sufficient = False
     if workflow == "image.insert":
@@ -515,6 +574,14 @@ def operate_object_recipe(
                     "inputs.recipe.target_position",
                 ),
             )
+        shape_probe_commands, shape_probe_elapsed, _, _, _, copied_shape_source = (
+            _execute(
+                candidate,
+                (MovePositionCommand(native_position(recipe_inputs.source_position)),),
+            )
+        )
+        if recipe_inputs.style_copy_type in (1, 2):
+            copied_shape_source = _numbered_shape(candidate, copied_shape_source)
         transfer = ParameterActionCommand(
             "ShapeCopyPaste",
             "HShapeCopyPaste",
@@ -524,6 +591,8 @@ def operate_object_recipe(
             MovePositionCommand(native_position(recipe_inputs.source_position)),
             transfer,
             MovePositionCommand(native_position(recipe_inputs.target_position)),
+            RunCommand("MoveParaBegin"),
+            RunCommand("MoveSelParaEnd"),
             transfer,
         )
         resolved_target_id = (
@@ -535,6 +604,8 @@ def operate_object_recipe(
     executed, elapsed, current_page, page_count, modified, after_snapshot = _execute(
         candidate, commands
     )
+    executed += shape_probe_commands
+    elapsed += shape_probe_elapsed
     if picture_caption_probe is not None:
         executed += picture_caption_probe.commands_executed
         elapsed += picture_caption_probe.elapsed_microseconds
@@ -686,6 +757,36 @@ def operate_object_recipe(
                 after_snapshot.cursor == style_target_position
                 and after_snapshot.style_id == style_expected_id
             )
+    if (
+        workflow == "style.copy"
+        and copied_shape_source is not None
+        and recipe_inputs is not None
+    ):
+        if recipe_inputs.style_copy_type in (1, 2):
+            after_snapshot = _numbered_shape(candidate, after_snapshot)
+        operation_verified = _verify_copied_shape(
+            copied_shape_source, after_snapshot, recipe_inputs.style_copy_type
+        )
+        operation_message = (
+            "원본의 글자·문단 모양 복사를 실행하고 관측된 속성을 비교했습니다."
+        )
+        if copied_shape_source.paragraph_format.heading_type == 2:
+            operation_message += (
+                " 자동 문단번호를 복사했습니다. 표·그림 제목은 번호를 직접 입력하지 말고 "
+                "제목 문구만 교체한 뒤 앞뒤 번호를 확인하세요."
+                " 개체 부착 캡션과 별도 제목의 중복도 확인하세요. "
+                "아래 조회에서 캡션이 나오지 않아도 숨은 캡션이 없다는 뜻은 아닙니다."
+            )
+            detail = inspect_native_structure(candidate.window_handle, current_page)
+            if detail is None:
+                operation_message += (
+                    " 이 쪽의 개체 부착 캡션 유무는 확인하지 못했습니다."
+                )
+            elif detail.captions:
+                operation_message += (
+                    f" 이 쪽에 개체 부착 캡션 {len(detail.captions)}개가 있습니다. "
+                    "별도 제목과 중복되면 숨은 번호가 끼어들 수 있으므로 함께 확인하세요."
+                )
     return _result(
         resolution,
         "executed",

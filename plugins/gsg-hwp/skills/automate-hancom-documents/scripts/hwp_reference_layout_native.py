@@ -18,7 +18,10 @@ from hwp_reference_layout_payload import (
     integer_array,
 )
 from hwp_reference_layout_placement import PlacementFrame
-from hwp_reference_layout_text_fitting import fit_reference_text_styles
+from hwp_reference_layout_text_fitting import (
+    ReferenceTextFitReport,
+    fit_reference_text_styles_with_report,
+)
 from hwp_reference_layout_text_flow import (
     ReferenceTextHeightError,
     minimum_text_height,
@@ -105,13 +108,20 @@ def reserve_text_row_heights(
     )
 
 
-def compile_reference_layout_command(
+def compile_reference_layout_command_with_fit_report(
     block: ReferenceLayoutBlock,
     page: SectionPageGeometry,
     *,
     page_number: int,
     base_style_id: int,
-) -> ParameterActionCommand:
+) -> tuple[ParameterActionCommand, ReferenceTextFitReport]:
+    """명령과 함께, 텍스트 맞춤이 실제로 줄인 값을 돌려준다.
+
+    ``fit_reference_text_styles`` 는 선언된 글자 크기·장평·자간·줄간격·여백을
+    셀에 맞을 때까지 조용히 줄인다(최저 선언값의 75%). 그 결과는 명령 배열
+    안의 서식 값으로만 남아, 호출한 쪽에서는 렌더를 보기 전까지 알 수 없었다.
+    여기서 함께 돌려주는 보고가 그 공백을 메운다 -- 맞춤 동작 자체는 그대로다.
+    """
     area = page.usable_area(page_number=page_number)
     frame = PlacementFrame.from_reference(
         area,
@@ -124,7 +134,7 @@ def compile_reference_layout_command(
     )
     columns = frame.map_columns(block.column_breakpoints)
     rows = frame.map_rows(block.row_breakpoints)
-    fitted_block = fit_reference_text_styles(
+    fitted_block, fit_report = fit_reference_text_styles_with_report(
         block,
         rows.sizes,
         columns.sizes,
@@ -156,18 +166,36 @@ def compile_reference_layout_command(
         *payload.values,
     ]
 
-    return ParameterActionCommand(
-        action="ReferenceLayoutBulk",
-        parameter_set="HTableCreation",
-        setters=(
-            NativeSetter("Rows", IntegerValue(len(rows.sizes))),
-            NativeSetter("Columns", IntegerValue(len(columns.sizes))),
-            NativeSetter("BaseStyleId", IntegerValue(base_style_id)),
-            NativeSetter("BodyLeft", IntegerValue(frame.left)),
-            NativeSetter("BodyTop", IntegerValue(frame.top)),
-            NativeSetter("BodyWidth", IntegerValue(frame.width)),
-            NativeSetter("BodyHeight", IntegerValue(frame.height)),
+    return (
+        ParameterActionCommand(
+            action="ReferenceLayoutBulk",
+            parameter_set="HTableCreation",
+            setters=(
+                NativeSetter("Rows", IntegerValue(len(rows.sizes))),
+                NativeSetter("Columns", IntegerValue(len(columns.sizes))),
+                NativeSetter("BaseStyleId", IntegerValue(base_style_id)),
+                NativeSetter("BodyLeft", IntegerValue(frame.left)),
+                NativeSetter("BodyTop", IntegerValue(frame.top)),
+                NativeSetter("BodyWidth", IntegerValue(frame.width)),
+                NativeSetter("BodyHeight", IntegerValue(frame.height)),
+            ),
+            arrays=tuple(array for array in arrays if array.count > 0),
+            array_values=tuple(values),
         ),
-        arrays=tuple(array for array in arrays if array.count > 0),
-        array_values=tuple(values),
+        fit_report,
     )
+
+
+def compile_reference_layout_command(
+    block: ReferenceLayoutBlock,
+    page: SectionPageGeometry,
+    *,
+    page_number: int,
+    base_style_id: int,
+) -> ParameterActionCommand:
+    return compile_reference_layout_command_with_fit_report(
+        block,
+        page,
+        page_number=page_number,
+        base_style_id=base_style_id,
+    )[0]

@@ -13,7 +13,14 @@ from hwp_document_style_usage import (
     paragraph_marker_is_unambiguous,
     paragraph_shape,
 )
-from hwp_document_table_profile import resolve_table_geometry, split_wide_table
+from hwp_document_table_profile import (
+    EMPTY_TABLE_CONVENTIONS,
+    ObservedTableConventions,
+    observed_table_conventions,
+    replicate_table_conventions,
+    resolve_table_geometry,
+    split_wide_table,
+)
 from hwp_live_contract import (
     DocumentStyle,
     ImageBlock,
@@ -21,6 +28,7 @@ from hwp_live_contract import (
     LayoutPlan,
     ParagraphBlock,
 )
+from hwp_live_structure_contract import DocumentStructure
 from hwp_report_layout import ReportListItemBlock
 from hwp_live_table_contract import TableBlock
 from hwp_live_values import ALIGNMENT_VALUES
@@ -452,6 +460,7 @@ def _table_style(
     fallback_style_id: int,
     content_width_mm: float,
     usage: DocumentStyleUsage,
+    conventions: ObservedTableConventions = EMPTY_TABLE_CONVENTIONS,
 ) -> TableBlock:
     block = (
         explicit_shared_borders(block)
@@ -507,7 +516,14 @@ def _table_style(
             ),
         }
     )
-    return resolve_table_geometry(styled, content_width_mm)
+    # The paragraphs inside the cells were just replicated through
+    # ``_paragraph_style``; this does the same for the cell fields themselves,
+    # which no observation reached before. Both leave every value the caller
+    # stated exactly where it was.
+    return resolve_table_geometry(
+        replicate_table_conventions(styled, conventions),
+        content_width_mm,
+    )
 
 
 def _image_style(
@@ -651,16 +667,24 @@ def resolve_layout_style_profile(
     fallback_style_id: int,
     content_width_mm: float,
     usage: DocumentStyleUsage | None = None,
+    structure: DocumentStructure | None = None,
 ) -> LayoutPlan:
     """Bind a plan to this document's style ids.
 
     ``usage`` is the [leading shape -> style id] table read from the document's
     own paragraphs. When it is present it outranks style-name matching; when it
     is absent (older bridge, scan failed) everything behaves exactly as before.
+
+    ``structure`` is the observed page's own tables, the only place cell
+    appearance is reported at all -- the paragraph scan behind ``usage`` never
+    descends into a table. When it is present the sampled cells fill in the
+    cell fields a table block left unset, exactly as ``usage`` fills in the
+    paragraph ones; when it is absent nothing changes.
     """
     if content_width_mm < 5:
         raise HwpLiveError("현재 문서의 본문 폭을 확인할 수 없습니다")
     observed = EMPTY_STYLE_USAGE if usage is None else usage
+    conventions = observed_table_conventions(structure)
     blocks: list[LayoutBlock] = []
     for block in plan.blocks:
         if isinstance(block, ParagraphBlock):
@@ -674,6 +698,7 @@ def resolve_layout_style_profile(
                     fallback_style_id,
                     content_width_mm,
                     observed,
+                    conventions,
                 )
                 for part in split_wide_table(block, available)
             )

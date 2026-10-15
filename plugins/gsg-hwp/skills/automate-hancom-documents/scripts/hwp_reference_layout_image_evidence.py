@@ -13,6 +13,10 @@ class ProjectionLine:
     strength: float
 
 
+# detect_layout_lines_from_image 의 결과 모양 — (행 후보, 열 후보).
+LayoutLines = tuple[tuple[ProjectionLine, ...], tuple[ProjectionLine, ...]]
+
+
 def _otsu_threshold(histogram: list[int], total: int) -> int:
     weighted_sum = sum(index * count for index, count in enumerate(histogram))
     background_weight = 0
@@ -176,8 +180,18 @@ def snap_layout_breakpoints_from_image(
     source_image: Image.Image,
     row_breakpoints: tuple[float, ...],
     column_breakpoints: tuple[float, ...],
+    layout_lines: LayoutLines | None = None,
 ) -> tuple[tuple[float, ...], tuple[float, ...]]:
-    row_lines, column_lines = detect_layout_lines_from_image(source_image)
+    # layout_lines 는 detect_layout_lines_from_image 의 결과를 그대로 받는
+    # 선택 인자다. 같은 이미지로 이 함수와 snap_column_gap_breakpoints 를
+    # 잇달아 부르는 호출자(analyze_layout_image)가 _dark_projections 전 픽셀
+    # 루프를 두 번 돌지 않게 한 번 계산한 값을 넘긴다. 생략하면 예전처럼
+    # 스스로 계산하므로 기존 호출자의 관측은 바뀌지 않는다.
+    row_lines, column_lines = (
+        detect_layout_lines_from_image(source_image)
+        if layout_lines is None
+        else layout_lines
+    )
     return (
         _snap_breakpoints(row_breakpoints, row_lines),
         _snap_breakpoints(column_breakpoints, column_lines),

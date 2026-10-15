@@ -18,7 +18,13 @@ type PublicTableVerticalAlignment = Literal["top", "center", "bottom", "inherit"
 type PublicTableColor = ColorInput
 type PublicTableBorderStyle = HwpBorderStyle
 type PublicTableBorderWidth = HwpBorderWidth
+type PublicTableBorderSide = Literal["left", "right", "top", "bottom"]
 type PublicTableSplitMode = Literal["equal", "existing_grid"]
+
+
+class PublicCellFormatSource(ContractModel):
+    table_instance_id: str = Field(min_length=1, max_length=256)
+    cell: PublicCellAddress
 
 
 class PublicTableFormattingInput(ContractModel):
@@ -36,6 +42,9 @@ class PublicTableFormattingInput(ContractModel):
     border_style: PublicTableBorderStyle | None = None
     border_width: PublicTableBorderWidth | None = None
     border_color: PublicTableColor | None = None
+    border_sides: tuple[PublicTableBorderSide, ...] | None = Field(
+        default=None, min_length=1, max_length=4
+    )
 
     def to_parameters(self) -> Mapping[str, OperationInputValue]:
         # "inherit" means "change nothing". Emitting these two keys even then
@@ -74,6 +83,8 @@ class PublicTableFormattingInput(ContractModel):
             parameters["border_width"] = self.border_width
         if self.border_color is not None:
             parameters["border_color"] = canonical_rgb_hex(self.border_color)
+        if self.border_sides is not None:
+            parameters["border_sides"] = ",".join(dict.fromkeys(self.border_sides))
         return parameters
 
 

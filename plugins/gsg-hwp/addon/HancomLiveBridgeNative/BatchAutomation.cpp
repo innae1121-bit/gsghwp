@@ -88,6 +88,9 @@ constexpr DISPID kContentRevision = 38;
 // older bridges expose no member and Python retains checkpoint-first fallback.
 constexpr DISPID kPrepareTextPatches = 39;
 constexpr DISPID kExecutePreparedTextPatches = 40;
+// Capability-gated, read-only literal offsets. Older bridges must not treat
+// these offsets as native cursor coordinates or fall back to mutation.
+constexpr DISPID kPrepareLiteralTextPatches = 41;
 constexpr LONG kActivationIdle = 0;
 constexpr LONG kActivationPending = 1;
 constexpr LONG kActivationSucceeded = 2;
@@ -229,6 +232,9 @@ DISPID MemberId(const wchar_t* const name) noexcept {
     }
     if (_wcsicmp(name, L"PrepareTextPatches") == 0) {
         return kPrepareTextPatches;
+    }
+    if (_wcsicmp(name, L"PrepareLiteralTextPatches") == 0) {
+        return kPrepareLiteralTextPatches;
     }
     if (_wcsicmp(name, L"ExecutePreparedTextPatches") == 0) {
         return kExecutePreparedTextPatches;
@@ -1004,7 +1010,7 @@ HRESULT STDMETHODCALLTYPE BatchAutomation::Invoke(
             hancom::official_api::FormatDocumentContentRevision(revision),
             result);
     }
-    if (memberId == kPrepareTextPatches) {
+    if (memberId == kPrepareTextPatches || memberId == kPrepareLiteralTextPatches) {
         if ((flags & DISPATCH_METHOD) == 0 || parameters == nullptr ||
             argumentCount != 1 || result == nullptr) {
             return DISP_E_BADPARAMCOUNT;

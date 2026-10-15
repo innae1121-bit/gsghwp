@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Final, Literal
+from typing import Final, Literal, cast
 
 from pydantic import Field
 
@@ -24,8 +26,15 @@ from hwp_reference_layout_geometry import (
     MILLIMETERS_PER_INCH,
     SectionPageGeometry,
 )
-from hwp_reference_layout_native import compile_reference_layout_command
+from hwp_reference_layout_native import (
+    compile_reference_layout_command_with_fit_report,
+)
 from hwp_reference_layout_patch import ReferenceLayoutPatchBlock
+from hwp_reference_layout_text_fitting import (
+    REFERENCE_TEXT_FIT_FACT_PREFIX,
+    ReferenceTextFitReport,
+    reference_text_fit_fact,
+)
 from hwp_reference_layout_text_flow import character_em_width, wrapped_line_count
 
 
@@ -38,6 +47,35 @@ class LayoutPreflightProblem(ContractModel):
     reason_code: str
     estimated_width_mm: float = Field(ge=0)
     estimated_height_mm: float = Field(ge=0)
+
+
+class LayoutPreflightBlock(ContractModel):
+    block_index: int = Field(ge=0)
+    page_number: int
+    block_kind: str
+    estimated_width_mm: float = Field(ge=0)
+    estimated_height_mm: float = Field(ge=0)
+
+
+class LayoutPreflightPage(ContractModel):
+    """Explicit plan segment, not a prediction of HWP's automatic pagination."""
+
+    page_number: int
+    block_indices: tuple[int, ...]
+    estimated_height_mm: float = Field(ge=0)
+    estimated_height_uncertainty_mm: float = Field(ge=0)
+    estimated_height_upper_mm: float = Field(ge=0)
+    remaining_height_mm: float
+    remaining_height_lower_mm: float
+    trailing_paragraph_uncertainty_mm: float = Field(default=0.0, ge=0)
+
+
+class LayoutObservations(ContractModel):
+    pages: tuple[LayoutPreflightPage, ...] = ()
+    blocks: tuple[LayoutPreflightBlock, ...] = ()
+
+
+LAYOUT_OBSERVATIONS_PREFIX: Final = "layout_observations="
 
 
 class LayoutPreflightResult(ContractModel):
@@ -82,6 +120,9 @@ class _BlockEstimate:
     uncertainty_mm: float = 0.0
     # Human-readable names of what the numbers above rest on.
     basis: tuple[str, ...] = ()
+    # 참조 레이아웃에서만 채워진다. 이 블록의 높이·너비는 텍스트 맞춤이 글자를
+    # 줄인 *뒤*의 값이므로, 무엇을 얼마나 줄였는지가 곧 이 추정의 근거다.
+    text_fit: ReferenceTextFitReport | None = None
 
 
 # 25.4mm per inch / 72pt per inch. An exact unit conversion, not a tuning
@@ -138,6 +179,100 @@ _BASIS_WRAP_LOWER_BOUND: Final = (
     "line counts ignore word boundaries and are a lower bound; the band carries"
     " the difference against the word-aware model"
 )
+# 참조 레이아웃의 텍스트 맞춤이 선언된 서식을 실제로 줄였다는 사실.
+#
+# ``hwp_reference_layout_text_fit_optimizer.fit_text_to_cell`` 은 선언된 셀에
+# 글이 안 들어가면 여백 → 줄간격(50%) → 자간(-5%) → 장평(50%) → 글자 크기
+# (선언값의 75%) 순서로 줄인다. 그 결과가 어디에도 보고되지 않아, 모델은
+# 렌더를 눈으로 보기 전에는 9pt 로 시킨 글이 6.75pt·장평 50% 로 들어갔다는
+# 것을 알 수 없었다. 이 코드와, ``estimate_basis`` 에 함께 실리는
+# ``reference_text_fit=`` 사실이 그 공백을 메운다.
+#
+# 판정은 바꾸지 않는다: overflow·safe_to_write 는 종전 그대로다.
+REFERENCE_TEXT_AUTO_SHRUNK_REASON_CODE: Final = "REFERENCE_TEXT_AUTO_SHRUNK"
+_FIT_RELAY_OMITTED_PREFIX: Final = "reference_text_fit_blocks_omitted="
+
+# 쓰기 응답의 message 는 4,000자 상한이 걸린 계약 필드다
+# (hwp_operation_contract.OperationResult.message). 사전 검사 응답에는 그 상한이
+# 없어 셀 목록을 24개까지 싣지만, 그 문자열을 그대로 쓰기 메시지로 옮기면 참조
+# 블록이 둘만 돼도 상한을 넘어 쓰기 자체가 검증 오류로 죽는다. 그래서 옮길
+# 때는 남은 자리만큼만 싣고, 못 실은 셀·블록은 개수로 적는다. 집계
+# (조정 셀 수·최소 도달 글자 크기)는 어느 경우에도 잘리지 않는다.
+#
+# 값이 계약과 어긋나지 않는지는 tests/test_hwp_reference_layout_fit_reporting.py
+# 가 OperationResult.message 의 실제 max_length 와 맞대어 지킨다.
+LAYOUT_MESSAGE_FIELD_LIMIT: Final = 4_000
+# 잘린 블록 수를 적는 한 줄(과 그 앞의 빈칸)은 언제나 실릴 수 있게 자리를
+# 먼저 떼어 둔다. 블록은 계획당 최대 네 자리 수를 넘지 않는다.
+_FIT_RELAY_OMITTED_RESERVE: Final = len(_FIT_RELAY_OMITTED_PREFIX) + 5
+
+
+def _fit_fact_without_cells(entry: str) -> str:
+    """셀 목록만 덜어 낸 같은 사실. 덜어 낸 개수를 대신 적는다."""
+    payload = cast(
+        "dict[str, object]",
+        json.loads(entry.removeprefix(REFERENCE_TEXT_FIT_FACT_PREFIX)),
+    )
+    cells = payload.get("cells")
+    payload["cells"] = []
+    payload["cells_omitted_for_message_budget"] = (
+        len(cast("list[object]", cells)) if isinstance(cells, list) else 0
+    )
+    return REFERENCE_TEXT_FIT_FACT_PREFIX + json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def reference_text_fit_message_fact(
+    estimate_basis: Sequence[str],
+    *,
+    budget: int,
+) -> str:
+    """쓰기 응답 메시지에 붙일 자동 축소 사실. 축소가 없었으면 빈 문자열.
+
+    사전 검사가 이미 잰 것을 옮겨 싣기만 한다 -- 쓰기 경로는 같은 계획을 같은
+    용지로 컴파일하므로 두 값은 같은 맞춤의 결과다. 새로 재지 않는다.
+
+    결과 객체가 아니라 ``estimate_basis`` 자체를 받는다. 쓰기 경로의 시험들은
+    사전 검사를 ``SimpleNamespace(overflow="none")`` 으로 바꿔 끼우므로, 부르는
+    쪽이 ``getattr(preflight, "estimate_basis", ())`` 로 넘긴다 -- 바로 옆
+    ``adjustable_items`` 가 이미 쓰고 있는 방식이다.
+    """
+    entries = [
+        entry
+        for entry in estimate_basis
+        if entry.startswith(REFERENCE_TEXT_FIT_FACT_PREFIX)
+    ]
+    if not entries:
+        return ""
+    relayed: list[str] = []
+    remaining = budget - _FIT_RELAY_OMITTED_RESERVE
+    omitted = 0
+    for entry in entries:
+        candidate = entry if len(entry) <= remaining else _fit_fact_without_cells(entry)
+        if len(candidate) > remaining:
+            omitted += 1
+            continue
+        relayed.append(candidate)
+        remaining -= len(candidate) + 1
+    if omitted:
+        note = f"{_FIT_RELAY_OMITTED_PREFIX}{omitted}"
+        # 예약분은 자리를 "떼어 두는" 것이지 자리가 있다는 보장이 아니다.
+        # budget 이 예약분보다 작으면 remaining 이 음수로 시작해 모든 블록이
+        # omitted 로 떨어지고, 그때 이 표식을 무조건 붙이면 message 가 계약
+        # 상한(4,000자)을 넘어 쓰기 응답 자체가 검증 오류로 죽는다. 표식조차
+        # 들어갈 자리가 없으면 아무것도 붙이지 않는다 -- 기존 message 를 잘라
+        # 자리를 만드는 것은 하지 않는다. 이미 실린 관측 사실이 이 표식보다
+        # 무겁다.
+        #
+        # 남은 자리는 아직 안 쓴 remaining 에 처음 떼어 둔 예약분을 되돌린
+        # 값이고, 앞선 사실이 있으면 그 사이의 빈칸 한 칸까지 센다.
+        available = remaining + _FIT_RELAY_OMITTED_RESERVE
+        if len(note) + (1 if relayed else 0) <= available:
+            relayed.append(note)
+    return " ".join(relayed)
 
 
 def _text_width_em(text: str) -> float:
@@ -636,7 +771,7 @@ def _block_estimate(
     if isinstance(block, ReferenceLayoutPatchBlock):
         return _BlockEstimate(0, 0, 0, False, (), ())
     try:
-        command = compile_reference_layout_command(
+        command, fit_report = compile_reference_layout_command_with_fit_report(
             prepare_reference_layout(block),
             page_geometry,
             page_number=page_number,
@@ -661,6 +796,7 @@ def _block_estimate(
         False,
         (),
         ("use_reference_layout_patch",),
+        text_fit=fit_report if fit_report else None,
     )
 
 
@@ -731,9 +867,21 @@ def preflight_layout(
     adjustable: list[str] = []
     basis: list[str] = []
     layout_page_number = page_number
+    page_totals: list[tuple[int, float, float, tuple[int, ...]]] = []
+    page_block_indices: list[int] = []
+    block_summaries: list[LayoutPreflightBlock] = []
 
     for index, block in enumerate(plan.blocks):
         if isinstance(block, PageBreakBlock):
+            page_totals.append(
+                (
+                    layout_page_number,
+                    page_estimated,
+                    page_uncertainty,
+                    tuple(page_block_indices),
+                )
+            )
+            page_block_indices = []
             maximum_estimated = max(maximum_estimated, page_estimated)
             maximum_minimum = max(maximum_minimum, page_minimum)
             maximum_upper = max(maximum_upper, page_estimated + page_uncertainty)
@@ -750,6 +898,16 @@ def preflight_layout(
             layout_page_number,
         )
         estimates.append((index, block.kind, estimate))
+        page_block_indices.append(index)
+        block_summaries.append(
+            LayoutPreflightBlock(
+                block_index=index,
+                page_number=layout_page_number,
+                block_kind=block.kind,
+                estimated_width_mm=round(estimate.width_mm, 3),
+                estimated_height_mm=round(estimate.height_mm, 3),
+            )
+        )
         page_estimated += estimate.height_mm
         page_minimum += estimate.minimum_height_mm
         page_uncertainty += estimate.uncertainty_mm
@@ -758,12 +916,26 @@ def preflight_layout(
         reason_codes.extend(estimate.reason_codes)
         adjustable.extend(estimate.adjustable_items)
         basis.extend(estimate.basis)
+        if estimate.text_fit is not None:
+            reason_codes.append(REFERENCE_TEXT_AUTO_SHRUNK_REASON_CODE)
+            basis.append(reference_text_fit_fact(estimate.text_fit, block_index=index))
 
     trailing = _trailing_paragraph_uncertainty_mm(plan)
     if trailing > 0:
         page_uncertainty += trailing
         reason_codes.append("LAYOUT_TRAILING_PARAGRAPH_UNMEASURED")
         basis.append(_BASIS_TRAILING_PARAGRAPH)
+    # Preserve empty segments from leading/consecutive/final breaks. The existing
+    # estimator assigns trailing-paragraph uncertainty to the final segment,
+    # even after a final break; expose it separately instead of moving it.
+    page_totals.append(
+        (
+            layout_page_number,
+            page_estimated,
+            page_uncertainty,
+            tuple(page_block_indices),
+        )
+    )
     maximum_estimated = max(maximum_estimated, page_estimated)
     maximum_minimum = max(maximum_minimum, page_minimum)
     maximum_upper = max(maximum_upper, page_estimated + page_uncertainty)
@@ -809,6 +981,25 @@ def preflight_layout(
         reason_codes.append("DEFINITE_PAGE_OVERFLOW")
     elif possible:
         reason_codes.append("LAYOUT_REQUIRES_CONFIRMATION")
+    observation = LayoutObservations(
+        pages=tuple(
+            LayoutPreflightPage(
+                page_number=number,
+                block_indices=indices,
+                estimated_height_mm=round(height, 3),
+                estimated_height_uncertainty_mm=round(band, 3),
+                estimated_height_upper_mm=round(height + band, 3),
+                remaining_height_mm=round(usable_height - height, 3),
+                remaining_height_lower_mm=round(usable_height - height - band, 3),
+                trailing_paragraph_uncertainty_mm=(
+                    round(trailing, 3) if number == layout_page_number else 0.0
+                ),
+            )
+            for number, height, band, indices in page_totals
+        ),
+        blocks=tuple(block_summaries),
+    )
+    basis.append(LAYOUT_OBSERVATIONS_PREFIX + observation.model_dump_json())
     return LayoutPreflightResult(
         usable_width_mm=round(usable_width, 3),
         usable_height_mm=round(usable_height, 3),

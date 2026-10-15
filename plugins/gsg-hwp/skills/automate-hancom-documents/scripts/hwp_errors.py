@@ -98,6 +98,33 @@ class HwpTargetProcessLostError(HwpLiveError):
     pass
 
 
+class HwpTextPatchPreflightError(HwpLiveError):
+    """Preserve the native index and location through the read-only boundary."""
+
+    index: int
+    code: str
+    location: str
+
+    def __init__(
+        self,
+        index: int,
+        code: str,
+        location: str,
+        message: str,
+        *,
+        mutation_started: bool,
+        safe_to_repeat: bool,
+    ) -> None:
+        super().__init__(
+            f"text.patch preflight patches[{index}] {code}: {message}; location={location}",
+            mutation_started=mutation_started,
+            safe_to_repeat=safe_to_repeat,
+        )
+        self.index = index
+        self.code = code
+        self.location = location
+
+
 def is_hwp_target_process_lost_error(error: BaseException) -> bool:
     current: BaseException | None = error
     visited: set[int] = set()
